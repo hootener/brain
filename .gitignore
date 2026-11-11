@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Raw inbound: session transcripts, adopters' notes, bug reports. The findings
+# derived from these are committed in knowledge-catalog/reference/E0001; the
+# raw material is not. It accumulates, it is unreviewed, and once a finding is
+# written the transcript is spent. See feedback/README.md.
+feedback/*
+!feedback/README.md

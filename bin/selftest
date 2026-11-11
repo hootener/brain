@@ -1,0 +1,1920 @@
+#!/usr/bin/env python3
+"""Check that a fresh install works and that the tools survive foreign content.
+
+Usage: brain/bin/selftest [-v]
+Exit 1 on any failure. Writes nothing outside a temporary directory.
+
+## Why this exists
+
+Every defect this brain has fixed was found by adopting it into somebody
+else's project. **None was found by its own checks**, and the reason is
+structural: the template passes its own linter by construction, because the
+same hand wrote both. Three adoptions found a dozen bugs; the test suite
+found none, because there was no test suite.
+
+Two layers, and the second is the point.
+
+**The install test** is a smoke test. It would have caught two real bugs
+mechanically: a documented install path that left the host tracking a gitlink
+instead of eighty files, and a first install that greeted its adopter with
+seventeen dangling links.
+
+**The fixture** is a small corpus deliberately *not* written for this brain —
+a decision with no frontmatter, a status in prose, a citation in backticks, a
+running record whose entries postdate it. Every case in it is something a real
+project actually did. Keeping a sample permanently is the cheapest way to stop
+relying on the next adoption to notice.
+
+## What it cannot do
+
+It locks in what three adoptions taught us. It will not find the *next* class
+of design bug, because nobody has thought of that one yet. A green run here is
+not evidence that the brain is ready for a project it has never met; only
+meeting one is.
+"""
+import argparse
+import ast
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import traceback
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+passed, failed, skipped = [], [], []
+
+
+def check(name, ok, detail=''):
+    (passed if ok else failed).append(name)
+    mark = ' ok ' if ok else 'FAIL'
+    print(f'  [{mark}] {name}' + (f'\n         {detail}' if detail and not ok else ''))
+    return ok
+
+
+def skip(name, reason):
+    """A correct assertion whose precondition is absent.
+
+    Four checks need the template's own `example/` record, which an adopted
+    brain legitimately does not have. Reported as failures, they made the
+    suite permanently red — and product said exactly what that cost: *"I have
+    watched five failures for two rounds and stopped reading them, which is
+    precisely why a crash in the same block took a deliberate look to notice
+    rather than announcing itself."* A permanently red suite is a stale note,
+    which is D0001 applied to CI.
+
+    The line that distinguishes the two cases: **skip when the precondition is
+    absent, fail when the assertion is false.** Never reach for this to quiet
+    a check that is genuinely failing.
+    """
+    skipped.append((name, reason))
+    print(f'  [skip] {name}\n         {reason}')
+    return False
+
+
+def run(args, cwd):
+    p = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    return p.returncode, p.stdout + p.stderr
+
+
+# ----------------------------------------------------------------- the install
+
+def install(tmp, verbose):
+    """A fresh adopt into a throwaway host must be silent."""
+    host = os.path.join(tmp, 'host')
+    os.makedirs(host)
+    subprocess.run(['git', 'init', '-q', host], capture_output=True)
+    open(os.path.join(host, 'README.md'), 'w').write('# host\n')
+    subprocess.run(['git', 'add', '-A'], cwd=host, capture_output=True)
+    subprocess.run(['git', '-c', 'user.email=t@t', '-c', 'user.name=t',
+                    'commit', '-qm', 'init'], cwd=host, capture_output=True)
+
+    brain = os.path.join(host, 'brain')
+    shutil.copytree(ROOT, brain, ignore=shutil.ignore_patterns('.git'))
+
+    # Baseline measured *here*, in the throwaway host, before adopt runs.
+    #
+    # Measuring it against the real repository compared unlike things: an
+    # embedded brain may carry a typed edge pointing outside itself — one real
+    # brain has `resource: ../../../skills/voice-professional/SKILL.md` — which
+    # resolves where it lives and cannot resolve in a host containing nothing
+    # but the brain. That read as "the install added an error" when the
+    # install had added nothing and the context had changed. Same shape as
+    # every other host-dependence bug here: the fixture's own conditions
+    # mistaken for the subject's behaviour.
+    _, pre = run([os.path.join(brain, 'bin', 'lint')], brain)
+    base_errs = int(re.search(r'(\d+) errors', pre).group(1)) if 'errors' in pre else 0
+    baseline = int(re.search(r'(\d+) warnings', pre).group(1)) if 'warnings' in pre else 0
+
+    code, out = run([os.path.join(brain, 'bin', 'adopt')], brain)
+    if verbose:
+        print(out)
+    check('adopt exits clean', code == 0, out[-300:])
+
+    # The source is whatever brain this is run from, which for an adopter is
+    # *their* brain with their content in it. Asserting zero warnings there
+    # meant that following /brain-init correctly — which mandates `status:
+    # draft` on every import, and lint warns on drafts — turned their build
+    # red. A correct install of a brain with drafts in it has warnings.
+    #
+    # So: errors are never acceptable, and warnings are measured against the
+    # source rather than against zero.
+    code, out = run([os.path.join(brain, 'bin', 'lint')], brain)
+    errs = int(re.search(r'(\d+) errors', out).group(1)) if 'errors' in out else -1
+    warns = int(re.search(r'(\d+) warnings', out).group(1)) if 'warnings' in out else -1
+    # Against the source, not against zero. `install()` copies ROOT — the brain
+    # running the suite — so asserting an absolute zero asserts that *the
+    # adopter's own record is clean*, under a name about the install. A brain
+    # with two unfilled scaffolds in its own nodes failed a check about
+    # installation. The subject here is what the install adds, so that is what
+    # is measured. Seventh instance of this, again inside install().
+    check('the install adds no lint errors of its own',
+          errs >= 0 and errs <= base_errs,
+          f'{errs} after install, {base_errs} in the source: {out.strip()[-180:]}')
+    # Discounting warnings about links into content the install *relocated*.
+    # `bin/adopt` moves exactly what `.template-record` names into `example/`,
+    # so the change log — which is the adopter's file and is deliberately never
+    # rewritten, that being the round-6 data-loss class — keeps citations to
+    # nodes that have legitimately moved. Inherent to relocating anything, and
+    # lint already says "fine if it marks future work".
+    moved = set()
+    rec = os.path.join(brain, '.template-record')
+    if os.path.isfile(rec):
+        moved = {l.strip() for l in open(rec, encoding='utf-8')
+                 if l.strip() and not l.startswith('#')}
+    relocated = 0
+    for line in out.split('\n'):
+        if 'does not resolve' not in line:
+            continue
+        if any(m and m in line for m in moved):
+            relocated += 1
+    check('the install adds no warnings of its own',
+          warns - relocated <= baseline,
+          f'{warns} warnings ({relocated} about relocated nodes) against a '
+          f'source baseline of {baseline}')
+
+    for tool in ('doctor', 'stale'):
+        if tool == 'stale':
+            # Same correction: `stale` counts claims in the adopter's own
+            # prose, so a false claim they already carried is not something
+            # the install did. Compare to the source rather than to clean.
+            src_code, _ = run([os.path.join(ROOT, 'bin', tool)], ROOT)
+            code, out = run([os.path.join(brain, 'bin', tool)], brain)
+            if src_code != 0:
+                skip('stale is clean on a fresh install',
+                     'the source brain already carries a stale claim, so this '
+                     'install cannot be the cause')
+            else:
+                check('stale is clean on a fresh install', code == 0,
+                      out.strip()[-220:])
+            continue
+        if tool == 'stale' and not has_example(brain):
+            # `stale` counts decisions against the prose that claims a number,
+            # and the generic prose's counts describe the template's record.
+            skip('stale is clean on a fresh install', NO_EXAMPLE)
+            continue
+        code, out = run([os.path.join(brain, 'bin', tool)], brain)
+        check(f'{tool} is clean on a fresh install', code == 0, out.strip()[-220:])
+
+    code, out = run([os.path.join(brain, 'bin', 'graph-build'), '--check'], brain)
+    check('committed graph matches a fresh build', code == 0, out.strip())
+
+    # Keeping example/ reserves the ids it holds. The template's own record is
+    # relocated, not deleted, and those ids are still in the tree — so issuing
+    # them again would put two D0001s in one brain, which both the README and
+    # CLAUDE.md promise cannot happen. An adopter who wants D0001 uses --bare.
+    # The floor is whatever that type's highest id actually is, anywhere in the
+    # tree. It used to be hardcoded — G0001, D0009, T0009 — which are facts
+    # about *this* brain's example/, so an adopter whose example/ holds
+    # different ids failed a check describing somebody else's corpus. Fifth
+    # instance of the host-dependence bug, in the one function the guard for it
+    # deliberately exempts.
+    for kind, letter in (('goal', 'G'), ('decision', 'D'), ('task', 'T')):
+        if not has_example(brain):
+            skip(f'{kind} numbering clears what example/ holds', NO_EXAMPLE)
+            continue
+        highest = ''
+        for base, dirs, files in os.walk(brain):
+            dirs[:] = [d for d in dirs if d not in {'.git', 'bin', 'templates'}]
+            for f in files:
+                m = re.match(rf'^({letter}\d{{4}})-', f)
+                if m and m.group(1) > highest:
+                    highest = m.group(1)
+        code, out = run([os.path.join(brain, 'bin', 'new'), '--next', kind], brain)
+        got = out.strip()
+        check(f'{kind} numbering clears what example/ holds',
+              not highest or got > highest, f'got {got}, highest present {highest}')
+
+    # And a bare install, which keeps no example, starts at 1.
+    bare = os.path.join(os.path.dirname(brain), 'bare')
+    shutil.copytree(ROOT, bare, ignore=shutil.ignore_patterns('.git'))
+    run([os.path.join(bare, 'bin', 'adopt'), '--sibling', '--bare'], bare)
+    # Measured against the source, not against 1. ROOT here is whatever brain
+    # selftest was run from — for an adopter, theirs, with their nodes in it —
+    # so asserting G0001 turned a populated brain's CI red for having content.
+    for kind, letter in (('goal', 'G'), ('decision', 'D'), ('task', 'T')):
+        if not has_example(brain):
+            skip(f'--bare reclaims the ids example/ was holding ({kind})',
+                 NO_EXAMPLE)
+            continue
+        _, out = run([os.path.join(bare, 'bin', 'new'), '--next', kind], bare)
+        _, src_out = run([os.path.join(ROOT, 'bin', 'new'), '--next', kind], ROOT)
+        check(f'--bare reclaims the ids example/ was holding ({kind})',
+              out.strip() <= src_out.strip(),
+              f'bare offers {out.strip()}, source offers {src_out.strip()}')
+    shutil.rmtree(bare, ignore_errors=True)
+
+    link = os.path.join(host, '.claude', 'skills')
+    check('skills are discoverable from the host root',
+          os.path.isdir(link) and len(os.listdir(link)) > 5)
+    check('skills resolve into the brain',
+          os.path.realpath(link) == os.path.realpath(os.path.join(brain, 'skills')),
+          f'{os.path.realpath(link)} != {os.path.realpath(os.path.join(brain, "skills"))}')
+
+    # Nothing of ours in the host beyond the two things adopt announces.
+    added = set(os.listdir(host)) - {'.git', 'README.md'}
+    check('nothing written into the host but brain/ and .claude/',
+          added == {'brain', '.claude'}, f'also found: {sorted(added - {"brain", ".claude"})}')
+    check('the commit hook is installed',
+          os.path.exists(os.path.join(host, '.git', 'hooks', 'post-commit')))
+
+    # The install path that was documented wrongly for a year of this project's
+    # life: a clone leaves a .git inside the brain and the host tracks a
+    # gitlink — one entry instead of every file.
+    check('the brain carries no .git of its own', not os.path.isdir(os.path.join(brain, '.git')))
+
+    # Ids are unique within the **live record**. `example/` is a separate
+    # namespace, and this check used to deny that — "no id is used twice,
+    # example/ included" — while `.template-record`, written by bin/index,
+    # says "a brain that already holds its own D0001 keeps it". Coexistence is
+    # the documented intent; the check called the documented intent a failure.
+    #
+    # It cost a third adopter five failures: a hand-numbered port four months
+    # before the brain shipped `bin/new` left 14 ids overlapping example/'s,
+    # none of them reachable or confusing, all of them unavoidable. Any
+    # adopter with a pre-existing catalog would have seen the same, which
+    # makes this the suite telling them their brain is broken for having
+    # history.
+    #
+    # The real hazard — `bin/new` *issuing* an id example/ already holds — is
+    # a separate check, and it is the numbering one below.
+    def ids_under(root, skip):
+        seen, dupes = {}, []
+        for base, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in skip]
+            for f in files:
+                m = re.match(r'^([GDPSTE]\d{4})-', f)
+                if m:
+                    (dupes.append(m.group(1)) if m.group(1) in seen
+                     else seen.setdefault(m.group(1), f))
+        return seen, dupes
+
+    live_skip = {'.git', 'bin', 'templates', 'docs', 'example'}
+    live, dupes = ids_under(brain, live_skip)
+    check('no id is used twice in the live record', not dupes,
+          f'duplicates: {sorted(set(dupes))}')
+
+    ex = os.path.join(brain, 'example')
+    if os.path.isdir(ex):
+        held, _ = ids_under(ex, {'.git', 'bin', 'templates', 'docs'})
+        overlap = sorted(set(held) & set(live))
+        if overlap:
+            print(f'  [note] {len(overlap)} id(s) exist in both the live record '
+                  f'and example/: ' + ', '.join(overlap[:6])
+                  + ('…' if len(overlap) > 6 else ''))
+            print('         Not a failure. example/ is a separate namespace — a '
+                  'brain that')
+            print('         already held its own D0001 keeps it, which is what '
+                  '.template-record')
+            print('         promises. Delete example/ when you no longer want '
+                  'the worked example.')
+
+    # The data-loss path: adopt's own first-run output says "re-run with
+    # --with-ci", and the second run once swept the operator's own nodes into
+    # example/ — identified by position, which is where brain-init puts them.
+    # Every gate reported green afterwards.
+    run([os.path.join(brain, 'bin', 'new'), 'decision', 'Operator node'], brain)
+    before = sorted(os.listdir(os.path.join(brain, 'knowledge-catalog', 'decisions')))
+    run([os.path.join(brain, 'bin', 'adopt'), '--with-ci'], brain)
+    after = sorted(os.listdir(os.path.join(brain, 'knowledge-catalog', 'decisions')))
+    check('a second adopt leaves the operator\'s own nodes alone',
+          before == after, f'lost: {sorted(set(before) - set(after))}')
+    if not has_example(brain):
+        skip('doctor rejects a stray node in example/', NO_EXAMPLE)
+    elif not has_manifest(brain):
+        skip('doctor rejects a stray node in example/', NO_MANIFEST)
+    else:
+        check('doctor rejects a stray node in example/',
+              _stray_is_caught(brain))
+
+    return brain
+
+
+def _stray_is_caught(brain):
+    """Plant a node in example/ and confirm doctor refuses it."""
+    planted = os.path.join(brain, 'example', 'knowledge-catalog', 'decisions',
+                           'D9999-planted.md')
+    os.makedirs(os.path.dirname(planted), exist_ok=True)
+    open(planted, 'w').write('---\nid: D9999\ntype: decision\ntitle: "x"\n---\n')
+    code, out = run([os.path.join(brain, 'bin', 'doctor')], brain)
+    os.remove(planted)
+    return code != 0 and 'never put' in out
+
+
+# ------------------------------------------------------------------ the fixture
+
+# Content written for some other system. Every case here is something a real
+# project actually did, and the expectation is what the tools were designed to
+# do about it. `want` strings must appear in lint's output; `absent` must not.
+FIXTURE = [
+    {
+        'name': 'a decision with no frontmatter is an error',
+        'why': 'imported ADRs arrive as bare prose',
+        'path': 'knowledge-catalog/decisions/D0100-bare.md',
+        'body': '# A choice\n\nWe chose the thing.\n',
+        'want': ['no frontmatter'],
+    },
+    {
+        'name': 'an unquoted colon in a title is an error',
+        'why': 'nine real titles carried one; YAML truncates or throws',
+        'path': 'knowledge-catalog/decisions/D0101-colon.md',
+        'body': ('---\nid: D0101\ntype: decision\ntitle: Scope: what we cut\n'
+                 'description: "x"\ntimestamp: "2026-01-01"\ntags: []\nstatus: draft\n---\n\n'
+                 '# Context\nx\n# Decision\nx\n# Alternatives\nx\n# Consequences\nx\n'),
+        'want': ['contains ": " unquoted'],
+    },
+    {
+        'name': 'an imported draft is exempt from required headings',
+        'why': '21 real decisions carried none of this brain\'s section names',
+        'path': 'knowledge-catalog/decisions/D0102-draft.md',
+        'body': ('---\nid: D0102\ntype: decision\ntitle: "Imported"\n'
+                 'description: "x"\ntimestamp: "2026-01-01"\ntags: []\nstatus: draft\n---\n\n'
+                 '# Whatever shape the other project used\n\nProse.\n'),
+        'absent': ['D0102-draft.md: `decision` is missing'],
+    },
+    {
+        'name': 'a promoted decision must carry its headings',
+        'why': 'the exemption ends when a human vouches for the node',
+        'path': 'knowledge-catalog/decisions/D0103-active.md',
+        'body': ('---\nid: D0103\ntype: decision\ntitle: "Promoted"\n'
+                 'description: "x"\ntimestamp: "2026-01-01"\ntags: []\nstatus: active\n---\n\n'
+                 '# Whatever shape the other project used\n\nProse.\n'),
+        'want': ['is missing the `# Context` section'],
+    },
+    {
+        'name': 'a duplicate id is an error',
+        'why': 'git merges two D0014s cleanly when the slugs differ',
+        'path': 'knowledge-catalog/decisions/D0102-again.md',
+        'body': ('---\nid: D0102\ntype: decision\ntitle: "Clash"\n'
+                 'description: "x"\ntimestamp: "2026-01-01"\ntags: []\nstatus: draft\n---\n\nx\n'),
+        'want': ['duplicate id `D0102`'],
+    },
+    {
+        'name': 'an id that disagrees with its filename is an error',
+        'why': 'a rename would otherwise orphan the node',
+        'path': 'knowledge-catalog/decisions/D0104-mismatch.md',
+        'body': ('---\nid: D0105\ntype: decision\ntitle: "Mismatch"\n'
+                 'description: "x"\ntimestamp: "2026-01-01"\ntags: []\nstatus: draft\n---\n\nx\n'),
+        'want': ['filename does not start with its id'],
+    },
+    {
+        'name': 'a status outside its type\'s vocabulary is an error',
+        'why': 'real trackers write the reason into the status',
+        'path': 'tasks/misc/T0100-prose-status.md',
+        'body': ('---\nid: T0100\ntype: task\ntitle: "Prose status"\ndescription: "x"\n'
+                 'status: Blocked — waiting on the client\ninitiative: misc\n'
+                 'blocked_by: []\ntimestamp: "2026-01-01"\ntags: []\n---\n\n'
+                 '# What to build\nx\n# Acceptance criteria\n- [ ] x\n# Out of scope\n- x\n# Log\n'),
+        'want': ['is not one of'],
+    },
+    {
+        'name': 'an unknown category is an error',
+        'why': 'category is an enum, and question joined it deliberately',
+        'path': 'tasks/misc/T0101-category.md',
+        'body': ('---\nid: T0101\ntype: task\ntitle: "Bad category"\ndescription: "x"\n'
+                 'status: Not Ready\ncategory: nonsense\ninitiative: misc\n'
+                 'blocked_by: []\ntimestamp: "2026-01-01"\ntags: []\n---\n\n'
+                 '# What to build\nx\n# Acceptance criteria\n- [ ] x\n# Out of scope\n- x\n# Log\n'),
+        'want': ['category `nonsense` is not one of'],
+    },
+    {
+        'name': 'a node cited in backticks is reported as a lost edge',
+        'why': '174 real citations were invisible to every tool',
+        'path': 'knowledge-catalog/reference/E0100-backtick.md',
+        'body': ('---\nid: E0100\ntype: evidence\ntitle: "Backticked citation"\n'
+                 'description: "x"\ntimestamp: "2026-01-01"\ntags: []\nstatus: draft\n---\n\n'
+                 'Carries out `../decisions/D0102-draft.md`, which is a lost edge.\n'),
+        'want': ['cites a node in backticks'],
+    },
+    {
+        'name': 'a backticked citation of a node that does not exist is reported',
+        'why': 'a dead citation in prose rots in silence',
+        'path': 'knowledge-catalog/reference/E0101-dead.md',
+        'body': ('---\nid: E0101\ntype: evidence\ntitle: "Dead citation"\n'
+                 'description: "x"\ntimestamp: "2026-01-01"\ntags: []\nstatus: draft\n---\n\n'
+                 'See `../decisions/D0999-nope.md` for the reasoning.\n'),
+        'want': ['names a node that does not exist'],
+    },
+    {
+        'name': 'a node citing one written later is reported',
+        'why': 'a port that stamped the import date made every citation a violation',
+        'path': 'knowledge-catalog/reference/E0102-early.md',
+        'body': ('---\nid: E0102\ntype: evidence\ntitle: "Written first"\n'
+                 'description: "x"\ntimestamp: "2020-01-01"\ntags: []\nstatus: draft\n---\n\n'
+                 'Depends on [D0102](../decisions/D0102-draft.md).\n'),
+        'want': ['which is newer'],
+    },
+    {
+        'name': 'a running record may cite nodes newer than itself',
+        'why': 'a log opened in July cites the November decisions it records',
+        'path': 'knowledge-catalog/reference/E0103-log.md',
+        'body': ('---\nid: E0103\ntype: evidence\ntitle: "A running record"\n'
+                 'description: "x"\ntimestamp: "2020-01-01"\ntags: []\nstatus: draft\n'
+                 'append_only: true\n---\n\n'
+                 'Records [D0102](../decisions/D0102-draft.md).\n'),
+        'absent': ['E0103-log.md ('],
+    },
+]
+
+
+def has_example(brain):
+    """Did this install carry the template's own record into `example/`?
+
+    An adopted brain has none: `bin/adopt` relocates only what
+    `.template-record` names, and a brain installed into a populated
+    repository, or with `--bare`, keeps nothing. Four checks below are correct
+    assertions about that record, so without it their precondition is absent.
+    """
+    d = os.path.join(brain, 'example')
+    if not os.path.isdir(d):
+        return False
+    for base, dirs, files in os.walk(d):
+        if any(re.match(r'^[GDPSTE]\d{4}-.*\.md$', f) for f in files):
+            return True
+    return False
+
+
+NO_EXAMPLE = ("no example/ here — the template's own record was never installed "
+              "in this brain, so there is nothing for this to assert against")
+
+NO_MANIFEST = ("no `example/.manifest` here — this brain's example/ predates the "
+               "manifest adopt now writes, so nothing identifies which nodes "
+               "are the template's and a stray cannot be told from a real one")
+
+
+def has_manifest(brain):
+    """Is there a manifest saying which nodes came from the template?
+
+    Two checks need identity rather than presence: `doctor` telling a stray
+    node in `example/` from a legitimate one, and the repoint knowing which
+    citations are upstream's. A brain installed before `.template-record`
+    shipped has `example/` and no manifest, and both checks failed on it for
+    want of data rather than for being wrong.
+    """
+    # `example/.manifest`, which is what `doctor` and the repoint actually
+    # require — not the top-level `.template-record`. Checking the wrong file
+    # left both checks failing on a brain that had the one and not the other,
+    # and `doctor` was already printing the right diagnosis one line away.
+    return os.path.isfile(os.path.join(brain, 'example', '.manifest'))
+
+
+def _demo_initiative(brain, marker=True):
+    """Two plans where the lower id is *not* the initiative's own."""
+    os.makedirs(os.path.join(brain, 'plans', 'demo', 'handoff'), exist_ok=True)
+    os.makedirs(os.path.join(brain, 'tasks', 'demo'), exist_ok=True)
+    open(os.path.join(brain, 'knowledge-catalog', 'goals', 'G0100-demo.md'),
+         'w').write(
+        '---\nid: G0100\ntype: goal\ntitle: "Demo goal"\n'
+        'description: "d"\nstatus: active\ntimestamp: "2023-12-01"\n'
+        'tags: []\n---\n# Goal\nx\n# Why\nx\n# Signals\n- x\n')
+    for pid, title, extra in (
+            ('P0100', 'Demo Phase 1 Backend', ''),
+            ('P0105', 'Demo plan',
+             ('initiative_plan: true\n' if marker else '')
+             + 'consent_by: "2026-11-20"\n')):
+        open(os.path.join(brain, 'plans', 'demo', f'{pid}-x.md'), 'w').write(
+            f'---\nid: {pid}\ntype: plan\ntitle: "{title}"\n'
+            'description: "d"\nstatus: active\ninitiative: demo\n'
+            'serves: ../../knowledge-catalog/goals/G0100-demo.md\n'
+            f'{extra}timestamp: "2024-01-01"\ntags: []\n---\n# Plan\nx\n')
+    open(os.path.join(brain, 'tasks', 'demo', 'T0100-x.md'), 'w').write(
+        '---\nid: T0100\ntype: task\ntitle: "Demo task"\n'
+        'description: "d"\nstatus: Complete\ninitiative: demo\n'
+        'blocked_by: []\ntimestamp: "2024-02-01"\ntags: []\n---\n'
+        '# What to build\nx\n# Acceptance criteria\n- [x] x\n'
+        '# Out of scope\n- The production flip\n# Log\n')
+    open(os.path.join(brain, 'plans', 'demo', 'handoff', 'executive.md'),
+         'w').write('# In short\nBuilt.\n# Production\n'
+                    'If we hear nothing by the consent date it ships.\n')
+
+
+def synthetic_brain(prefix):
+    """A brain holding the template's tooling and none of its content.
+
+    The migration fixtures used to be `copytree(ROOT)` with the Intent layer
+    deleted afterwards — which left ~100 of this brain's own tasks and plans
+    citing decisions the fixture had just removed. The assertion then read
+    `0 errors · 0 warnings`, so it could only pass for a brain whose tasks do
+    not cite its own decisions, and failed on every real adopter for a reason
+    unrelated to its name. product caught it and nearly reported the failure as
+    corroboration of a different finding.
+
+    The host's content is the one variable a test about migration cannot
+    control, so it is not used. Callers write the few nodes they mean to
+    measure.
+    """
+    brain = os.path.join(tempfile.mkdtemp(prefix=prefix), 'brain')
+    for rel in ('bin', 'skills', 'hooks', 'docs',
+                'knowledge-catalog/reference/agent-skills'):
+        src = os.path.join(ROOT, rel)
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(brain, rel))
+    # config.md is written, not copied. Copying the host's carried `mode:
+    # sibling` into the fixture, so it was born already-adopted and the
+    # migration check measured a brain that had nothing left to migrate. product
+    # proved it by flipping that one field: sibling failed, template passed.
+    # Fourth instance of one root cause, by then a single line wide.
+    open(os.path.join(brain, 'config.md'), 'w', encoding='utf-8').write(
+        '---\ntype: reference\ntitle: Configuration\n'
+        'description: "How this brain is installed."\n'
+        'mode: template\nrepos: []\nbrain_revision: ""\n'
+        'human_fields: []\n'
+        'timestamp: "2024-01-01"\ntags: []\nstatus: active\n---\n\n'
+        '# Configuration\n\nHow this brain is installed.\n')
+    for rel in ('INIT.md', 'README.md', 'CLAUDE.md', '.gitignore',
+                '.template-record', 'knowledge-catalog/howto.md'):
+        src = os.path.join(ROOT, rel)
+        if os.path.isfile(src):
+            d = os.path.join(brain, rel)
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            shutil.copy2(src, d)
+    for rel in ('knowledge-catalog/decisions', 'knowledge-catalog/goals',
+                'knowledge-catalog/specs', 'tasks', 'plans', 'work',
+                'brief', 'feedback'):
+        os.makedirs(os.path.join(brain, rel), exist_ok=True)
+    open(os.path.join(brain, 'knowledge-catalog', 'glossary.md'), 'w').write(
+        '---\ntype: glossary\ntitle: Glossary\ndescription: "Vocabulary."\n'
+        'timestamp: "2024-01-01"\ntags: [glossary]\nstatus: active\n---\n'
+        '# Glossary\n\nNothing yet.\n')
+    open(os.path.join(brain, 'knowledge-catalog', 'log.md'), 'w').write(
+        '# Change log\n\nNothing yet.\n')
+    return brain
+
+
+def fixture(brain, verbose):
+    """Write foreign content into a copy of the brain and check the reaction."""
+    for case in FIXTURE:
+        path = os.path.join(brain, case['path'])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, 'w', encoding='utf-8').write(case['body'])
+
+    _, out = run([os.path.join(brain, 'bin', 'lint')], brain)
+    if verbose:
+        print(out)
+
+    for case in FIXTURE:
+        ok = all(w in out for w in case.get('want', []))
+        ok = ok and not any(a in out for a in case.get('absent', []))
+        missing = [w for w in case.get('want', []) if w not in out]
+        seen = [a for a in case.get('absent', []) if a in out]
+        check(case['name'], ok,
+              (f'expected but absent: {missing}' if missing else '')
+              + (f'  present but should not be: {seen}' if seen else ''))
+
+    # bin/relink converts the resolvable citation and leaves the dead one.
+    _, out = run([os.path.join(brain, 'bin', 'relink')], brain)
+    e100 = open(os.path.join(brain, 'knowledge-catalog/reference/E0100-backtick.md')).read()
+    e101 = open(os.path.join(brain, 'knowledge-catalog/reference/E0101-dead.md')).read()
+    check('relink converts a resolvable citation into a link', '](../decisions/D0102-draft.md)' in e100)
+    check('relink leaves a dead citation alone', '`../decisions/D0999-nope.md`' in e101)
+
+    # A plan blocker holds a task off the frontier.
+    os.makedirs(os.path.join(brain, 'plans', 'probe'), exist_ok=True)
+    open(os.path.join(brain, 'plans/probe/P0100-probe.md'), 'w').write(
+        '---\nid: P0100\ntype: plan\ntitle: "Probe"\ndescription: "x"\n'
+        'initiative: probe\ntimestamp: "2026-01-01"\ntags: []\nstatus: active\n'
+        'serves: ../../knowledge-catalog/goals/index.md\n---\n\n'
+        '# Goal\nx\n# Approach\nx\n# Sequence\n1. x\n# Risks\n- x\n')
+    open(os.path.join(brain, 'tasks/misc/T0102-planblocked.md'), 'w').write(
+        '---\nid: T0102\ntype: task\ntitle: "Blocked on an initiative"\ndescription: "x"\n'
+        'status: Ready for Development\ncategory: question\ninitiative: misc\n'
+        'blocked_by: [../../plans/probe/P0100-probe.md]\ntimestamp: "2026-01-01"\ntags: []\n---\n\n'
+        '# What to build\nx\n# Acceptance criteria\n- [ ] x\n# Out of scope\n- x\n# Log\n')
+    _, out = run([os.path.join(brain, 'bin', 'status'), 'misc'], brain)
+    check('a plan with no finished tasks blocks a dependent task',
+          'T0102' not in out.split('frontier')[-1], out.split('frontier')[-1].strip()[:160])
+    check('the blocker column names the initiative', 'plan:probe' in out, out[-200:])
+
+
+def regressions(brain, verbose):
+    """One check per finding that changed code.
+
+    The fixture above is a corpus of foreign content, written before any real
+    adopter saw this. These are different: each locks a specific defect a cold
+    adoption reported, so the fix cannot be undone by a later one. Four rounds
+    of feedback produced roughly twenty code changes and five checks, which is
+    why the same classes kept coming back — a parser bug, a laundering path and
+    an install recipe each broke twice.
+
+    **A fix lands with its check.** Anything here names the round it came from.
+    """
+    B = lambda *a: os.path.join(brain, *a)
+
+    # R3 — a key with no inline value opens a block sequence; five tools set it
+    # to '' and silently dropped every item, so `constrains:` governed nothing.
+    open(B('knowledge-catalog', 'decisions', 'D0100-block-seq.md'), 'w').write(
+        '---\nid: D0100\ntype: decision\ntitle: "Block sequence"\n'
+        'description: "x"\ntimestamp: "2026-01-01"\ntags: []\nstatus: draft\n'
+        'constrains:\n  - app/pricing\n  - app/billing\n---\n\n# Context\nx\n')
+    _, out = run([B('bin', 'constraints'), 'app/pricing/Rate.php'], brain)
+    check('R3 · a block-sequence `constrains:` actually governs',
+          'D0100' in out, out.strip()[:200])
+
+    # R2 — the excerpt came from # Context, where a decision states the position
+    # it rejects, so the evidence argued against the decision it came from.
+    open(B('knowledge-catalog', 'decisions', 'D0101-quote.md'), 'w').write(
+        '---\nid: D0101\ntype: decision\ntitle: "Quoting probe"\n'
+        'description: "x"\ntimestamp: "2026-01-01"\ntags: []\nstatus: draft\n---\n\n'
+        '# Context\nA sprocket library could plausibly cover both cases.\n\n'
+        '# Decision\nA sprocket library covers one case and never the other.\n')
+    _, out = run([B('bin', 'relevant'), 'sprocket library covering both'], brain)
+    check('R2 · the quote comes from the claim, not from # Context',
+          'could plausibly cover' not in out, out.strip()[:200])
+
+    # R2 — /brain-init promised lint reported this; nothing did.
+    _, out = run([B('bin', 'lint')], brain)
+    check('R2 · lint reports the draft count', 'draft' in out, out.strip()[-200:])
+
+    # R1 — placeholders reached the record past a green gate.
+    run([B('bin', 'new'), 'evidence', 'Scaffold regression'], brain)
+    _, out = run([B('bin', 'lint')], brain)
+    check('R1 · an unfilled scaffold is an error',
+          'scaffold token' in out, out.strip()[-200:])
+
+    # R1 — nothing wrote an index while two documents promised something did.
+    idx = open(B('knowledge-catalog', 'reference', 'index.md')).read()
+    check('R1 · bin/new puts the node in its folder index',
+          'Scaffold regression' in idx, idx[-200:])
+    log = open(B('knowledge-catalog', 'log.md')).read()
+    check('R1 · bin/new appends to the change log',
+          'Scaffold regression' in log, log[:200])
+
+    for f in ('D0100-block-seq.md', 'D0101-quote.md'):
+        os.remove(B('knowledge-catalog', 'decisions', f))
+    for f in os.listdir(B('knowledge-catalog', 'reference')):
+        if 'scaffold-regression' in f:
+            os.remove(B('knowledge-catalog', 'reference', f))
+
+    # R2 — the forward walk called an initiative with nothing in it complete.
+    # A distinct id: the foreign-content fixture leaves a P0100 behind, and
+    # bin/ancestry rightly refuses to guess between two nodes sharing one.
+    os.makedirs(B('plans', 'asked'), exist_ok=True)
+    open(B('plans', 'asked', 'P0101-nothing-asked.md'), 'w').write(
+        '---\nid: P0101\ntype: plan\ntitle: "Nothing asked"\ndescription: "x"\n'
+        'initiative: asked\ntimestamp: "2026-01-01"\ntags: []\nstatus: active\n'
+        'serves: ../../knowledge-catalog/goals/index.md\n---\n\n# Goal\nx\n')
+    _, out = run([B('bin', 'ancestry'), 'P0101', '--forward'], brain)
+    check('R2 · an intent nothing asked of is not reported complete',
+          'not been asked for yet' in out, out.strip()[-200:])
+    shutil.rmtree(B('plans', 'asked'), ignore_errors=True)
+
+    # R4 — the update recipe copied directories only, so INIT.md never arrived
+    # and an updated install had neither the skill nor the document.
+    os.remove(B('INIT.md'))
+    _, out = run([B('bin', 'update'), ROOT], brain)
+    check('R4 · an update restores every generic file, INIT.md included',
+          os.path.isfile(B('INIT.md')), out.strip()[-200:])
+
+    # R3/R4 — a skill body in a user-role envelope published as the operator's.
+    _, out = run([B('bin', 'utterances'), '--limit', '200'], brain)
+    check('R3 · an injected skill body is not attributed to the operator',
+          'Base directory for this skill' not in out, out.strip()[:200])
+
+    # R4 — nothing recorded which upstream revision a brain was running, so
+    # "did the update land" meant diffing two trees by hand.
+    cfg = open(B('config.md')).read()
+    check('R4 · the install records its upstream revision',
+          re.search(r'^brain_revision: "\S+"', cfg, re.M) is not None,
+          cfg[:200])
+    _, out = run([B('bin', 'doctor')], brain)
+    check('R4 · doctor prints the upstream revision', 'upstream:' in out, out[:200])
+
+    # R4 — a `timestamp: "<YYYY-MM-DD>"` inside a skill's illustrative
+    # frontmatter is the point of the example. Stamping it destroys what is
+    # being shown; flagging it ends every check dirty.
+    check('R4 · an illustrative placeholder in a skill is not flagged',
+          'YYYY-MM-DD' not in out, out[-200:])
+
+    # R4 — generic documents cited upstream decisions by bare id. After an
+    # install those ids belong to the adopter, so the citation resolves — to
+    # the wrong node, which is worse than dangling.
+    bare = []
+    for f in ('INIT.md', 'CLAUDE.md', 'README.md'):
+        t = open(B(f)).read()
+        bare += re.findall(r'\[[GDPSTE]\d{4}\]\([^)]*knowledge-catalog[^)]*\)', t)
+    check('R4 · no generic document cites a node by bare id', not bare, str(bare[:2]))
+
+    # R4 — an update re-copies the generic prose, which arrives citing
+    # knowledge-catalog/; without a repoint those citations resolve wrongly.
+    if has_example(brain) and has_manifest(brain):
+        _, out = run([B('bin', 'adopt'), '--repoint-only'], brain)
+        check('R4 · the example repoint can be re-run after an update',
+              'repointed' in out, out[:200])
+    elif has_example(brain):
+        _, out = run([B('bin', 'adopt'), '--repoint-only'], brain)
+        check('R4 · the repoint says what it did even when it did nothing',
+              out.strip() != '', 'silent run')
+    elif has_example(brain):
+        skip('R4 · the example repoint can be re-run after an update',
+             NO_MANIFEST)
+    else:
+        # It already printed "no example/ here — nothing to repoint", which
+        # product called a skip reason wearing a failure's clothes.
+        skip('R4 · the example repoint can be re-run after an update',
+             NO_EXAMPLE)
+
+    # R5 — the repoint walked feedback/, which holds raw evidence kept
+    # nowhere else, and rewrote it. bin/update --list promises the opposite.
+    os.makedirs(B('feedback'), exist_ok=True)
+    raw = B('feedback', 'probe.md')
+    open(raw, 'w').write(
+        'cites knowledge-catalog/decisions/D0001-claims-must-be-checkable.md\n'
+        '```\n[D0001](knowledge-catalog/decisions/D0001-claims-must-be-checkable.md)\n```\n')
+    sig = open(raw).read()
+    run([B('bin', 'adopt'), '--repoint-only'], brain)
+    check('R5 · the repoint does not touch raw feedback', open(raw).read() == sig)
+
+    # R5 — run twice it produced example/example/ in twelve generic files.
+    c1 = open(B('CLAUDE.md')).read()
+    run([B('bin', 'adopt'), '--repoint-only'], brain)
+    check('R5 · the repoint is idempotent', open(B('CLAUDE.md')).read() == c1)
+    check('R5 · no nested example/example anywhere',
+          not any('example/example' in open(os.path.join(b, f), errors='replace').read()
+                  for b, d, fs in os.walk(B('knowledge-catalog')) for f in fs
+                  if f.endswith('.md')))
+    os.remove(raw)
+
+    # product — the guard asked "does example/ exist", not "does the catalog have
+    # content", so a first adopt into a brain migrating from another one took
+    # a 12,339-byte change log down to 97.
+    import tempfile as _tf
+    mig = synthetic_brain('brain-mig-')
+    open(os.path.join(mig, 'knowledge-catalog', 'log.md'), 'w').write(
+        '# Change log\n\nNewest first.\n\n## 2026-07-01\n\n**Creation** — years of prose.\n')
+    subprocess.run(['git', 'init', '-q', os.path.dirname(mig)], capture_output=True)
+    run([os.path.join(mig, 'bin', 'adopt'), '--sibling'], mig)
+    kept = 'years of prose' in open(os.path.join(mig, 'knowledge-catalog', 'log.md')).read()
+    check('product · adopting into a populated brain keeps its change log', kept)
+    shutil.rmtree(os.path.dirname(mig), ignore_errors=True)
+
+    # product — the heart of it: the template's record was identified by filename
+    # *pattern*, which is every decision anybody will ever write. A first
+    # adopt into a brain already holding its own D0001 swept it into example/
+    # and called it ours. Identity, not pattern.
+    m2 = synthetic_brain('brain-mig2-')
+    # The generic document under test is written here, not inherited from
+    # whatever brain is running the suite.
+    with open(os.path.join(m2, 'CLAUDE.md'), 'w') as fh:
+        fh.write('# Generic\n\nSee [it]'
+                 '(knowledge-catalog/decisions/D0002-four-categories.md)\n')
+    open(os.path.join(m2, '.template-record'), 'w').write(
+        'knowledge-catalog/decisions/D0002-four-categories.md\n')
+    theirs = os.path.join(m2, 'knowledge-catalog', 'decisions', 'D0001-theirs.md')
+    open(theirs, 'w').write(
+        '---\nid: D0001\ntype: decision\ntitle: "Theirs"\ndescription: "x"\n'
+        'timestamp: "2024-03-01"\ntags: []\nstatus: active\n---\n'
+        '# Context\nx\n# Decision\nx\n# Alternatives\nx\n# Consequences\nx\n')
+    subprocess.run(['git', 'init', '-q', os.path.dirname(m2)], capture_output=True)
+    run([os.path.join(m2, 'bin', 'adopt'), '--sibling'], m2)
+    check("product · a populated brain keeps its own D0001", os.path.isfile(theirs))
+    # Assert the subject, not the host. A dangling link in the adopter's own
+    # log is honest — it names nodes that are genuinely not here. The defect
+    # was a citation that *resolved*, to a different decision of the same id.
+    _, out = run([os.path.join(m2, 'bin', 'lint')], m2)
+    generic = open(os.path.join(m2, 'CLAUDE.md')).read()
+    mis = re.findall(r'\]\((?:\.\./)*knowledge-catalog/decisions/D\d{4}-[^)]+\)', generic)
+    check('product · no generic document cites a local node after a migration',
+          not mis and ' 0 errors' in out, f'{mis[:2]} / {out.strip()[-120:]}')
+    shutil.rmtree(os.path.dirname(m2), ignore_errors=True)
+
+    # R5/product — bin/handoff wrote the page one directory above the screenshots,
+    # so every image 404'd: eleven of them, against a hand-written page where
+    # all eleven worked.
+    # Its own initiative: adopt relocates the template's plans/formalize to
+    # example/, so an adopted brain has no plan there to render from.
+    os.makedirs(B('plans', 'shot'), exist_ok=True)
+    os.makedirs(B('tasks', 'shot'), exist_ok=True)
+    open(B('plans', 'shot', 'P0200-shot.md'), 'w').write(
+        '---\nid: P0200\ntype: plan\ntitle: "Shot"\ndescription: "x"\n'
+        'initiative: shot\ntimestamp: "2026-01-01"\ntags: []\nstatus: active\n'
+        'serves: ../../knowledge-catalog/goals/index.md\n---\n\n'
+        '# Intent (forwardable)\nx\n# Goal\nx\n# Approach\nx\n')
+    hd = B('plans', 'shot', 'handoff')
+    os.makedirs(hd, exist_ok=True)
+    open(os.path.join(hd, 'product.md'), 'w').write(
+        '# Walkthrough\n\n1. **One.** ![shot](01-shot.png)\n')
+    run([B('bin', 'handoff'), 'shot', '--for', 'product'], brain)
+    page = B('plans', 'shot', 'handoff-product.html')
+    html = open(page).read() if os.path.isfile(page) else ''
+    check('product · a generated handoff points at its screenshots',
+          'src="handoff/01-shot.png"' in html, html[:200])
+    shutil.rmtree(B('plans', 'shot'), ignore_errors=True)
+    shutil.rmtree(B('tasks', 'shot'), ignore_errors=True)
+
+    # product2 — --dry-run wrote 22 files while printing "nothing written". The
+    # cautious path became the destructive one.
+    d1 = synthetic_brain('brain-dry-')
+    rec = os.path.join(d1, '.template-record')
+    if os.path.isfile(rec):
+        os.remove(rec)
+    sig = {}
+    for base, dirs, files in os.walk(d1):
+        for f in files:
+            if f.endswith('.md'):
+                fp = os.path.join(base, f)
+                sig[fp] = os.path.getmtime(fp), os.path.getsize(fp)
+    run([os.path.join(d1, 'bin', 'adopt'), '--sibling', '--dry-run'], d1)
+    moved_any = any(os.path.getsize(k) != v[1] for k, v in sig.items()
+                    if os.path.isfile(k))
+    check('product2 · --dry-run writes nothing', not moved_any)
+    shutil.rmtree(os.path.dirname(d1), ignore_errors=True)
+
+    # product2 — the citation rewrite could not tell the template's D0004 from the
+    # adopter's, and sent 55 live links to 404s lint cannot see.
+    d2 = synthetic_brain('brain-cite-')
+    # Everything this fixture measures is written here. Copying the template's
+    # own D0004 out of ROOT crashed the whole suite on an adopted brain, which
+    # has no such file — the identical mistake as the migration fixture one
+    # commit earlier, made while fixing that one. The host's content is not
+    # available to a portability test, full stop.
+    upstream_node = 'D0004-placement-and-install.md'
+    open(os.path.join(d2, 'knowledge-catalog', 'decisions', upstream_node),
+         'w').write(
+        '---\nid: D0004\ntype: decision\ntitle: "Upstream"\n'
+        'description: "x"\ntimestamp: "2024-01-01"\ntags: []\n'
+        'status: active\n---\n# Context\nx\n# Decision\nx\n'
+        '# Alternatives\nx\n# Consequences\nx\n')
+    open(os.path.join(d2, '.template-record'), 'w').write(
+        f'knowledge-catalog/decisions/{upstream_node}\n')
+    # A generic document citing it, so the positive case does not depend on
+    # what CLAUDE.md happens to cite in whatever brain is running this.
+    with open(os.path.join(d2, 'CLAUDE.md'), 'a') as fh:
+        fh.write(f'\nSee [it](knowledge-catalog/decisions/{upstream_node})\n')
+    os.makedirs(os.path.join(d2, 'tasks', 'misc'), exist_ok=True)
+    theirs = os.path.join(d2, 'tasks', 'misc', 'T0200-theirs.md')
+    open(theirs, 'w').write(
+        '---\nid: T0200\ntype: task\ntitle: "Theirs"\ndescription: "x"\n'
+        'status: Not Ready\ninitiative: misc\nblocked_by: []\n'
+        'timestamp: "2024-01-01"\ntags: []\n---\n# What to build\n'
+        'See [ADR](../../knowledge-catalog/decisions/D0004-placement-and-install.md)\n'
+        '# Acceptance criteria\n- [ ] x\n# Out of scope\n- x\n# Log\n')
+    cfg = os.path.join(d2, 'config.md')
+    t = open(cfg).read().replace('mode: template', 'mode: sibling')
+    open(cfg, 'w').write(t)
+    run([os.path.join(d2, 'bin', 'adopt'), '--repoint-only'], d2)
+    check("product2 · the rewrite leaves the adopter's own citations alone",
+          'github.com' not in open(theirs).read())
+    # And the positive half. The negative alone passed against a version where
+    # the scoping was dead code and a stray indent suppressed the write — a
+    # test that only checks "nothing happened" cannot tell a correct guard
+    # from a function that does nothing at all.
+    claude = open(os.path.join(d2, 'CLAUDE.md')).read()
+    check('product2 · and does rewrite a generic document that cites one',
+          'github.com/hootener/brain/blob/main/knowledge-catalog' in claude)
+    _, out = run([os.path.join(d2, 'bin', 'lint')], d2)
+    check('product2 · and the brain still lints clean afterwards',
+          ' 0 errors' in out, out.strip()[-160:])
+    shutil.rmtree(os.path.dirname(d2), ignore_errors=True)
+
+    # product2 — .template-record is the identity data the rewrite needs, and it
+    # was not in the update manifest, so an updated brain never received it.
+    _, out = run([B('bin', 'update'), '--list'], brain)
+    check('product2 · .template-record is carried by an update',
+          '.template-record' in out, out[:200])
+
+    # product2 — an authored heading matching no known section title was dropped
+    # without a word: five of eight sections of a real executive handoff, the
+    # author with no symptom to notice.
+    h = synthetic_brain('brain-hand-')
+    os.makedirs(os.path.join(h, 'plans', 'demo', 'handoff'), exist_ok=True)
+    os.makedirs(os.path.join(h, 'tasks', 'demo'), exist_ok=True)
+    open(os.path.join(h, 'knowledge-catalog', 'goals', 'G0001-demo.md'), 'w').write(
+        '---\nid: G0001\ntype: goal\ntitle: "Demo goal"\n'
+        'description: "d"\nstatus: active\ntimestamp: "2023-12-01"\n'
+        'tags: []\n---\n# Goal\nx\n# Why\nx\n# Signals\n- x\n')
+    open(os.path.join(h, 'tasks', 'demo', 'T0001-demo.md'), 'w').write(
+        '---\nid: T0001\ntype: task\ntitle: "Demo task"\n'
+        'description: "d"\nstatus: Complete\ninitiative: demo\n'
+        'blocked_by: []\ntimestamp: "2024-02-01"\ntags: []\n---\n'
+        '# What to build\nx\n# Acceptance criteria\n- [x] x\n'
+        '# Out of scope\n- The production flip\n# Log\n')
+    open(os.path.join(h, 'plans', 'demo', 'P0001-demo.md'), 'w').write(
+        '---\nid: P0001\ntype: plan\ntitle: "Demo plan"\n'
+        'description: "d"\nstatus: active\ninitiative: demo\n'
+        'serves: ../../knowledge-catalog/goals/G0001-demo.md\n'
+        'timestamp: "2024-01-01"\ntags: []\n---\n# Demo\nx\n')
+    open(os.path.join(h, 'plans', 'demo', 'P0009-subfeature.md'), 'w').write(
+        '---\nid: P0009\ntype: plan\ntitle: "Sub-feature plan"\n'
+        'description: "d"\nstatus: active\ninitiative: demo\n'
+        'serves: ../../knowledge-catalog/goals/G0001-demo.md\n'
+        'timestamp: "2024-06-01"\ntags: []\n---\n# Sub\nx\n')
+    open(os.path.join(h, 'plans', 'demo', 'handoff', 'executive.md'), 'w').write(
+        '# In short\nDone.\n# Production\nGo-live 2026-11-20.\n')
+    run([os.path.join(h, 'bin', 'handoff'), 'demo', '--for', 'executive'], h)
+    page = os.path.join(h, 'plans', 'demo', 'handoff-executive.html')
+    body = open(page).read() if os.path.isfile(page) else ''
+    check('product2 · an authored section with no matching block still renders',
+          '2026-11-20' in body and 'Production' in body, body[:120])
+    # And the page is titled after the initiative's own plan, not the newest
+    # sub-feature plan that happens to sort last.
+    check("product2 · the handoff picks the initiative's plan, not the newest",
+          '<title>Demo</title>' in body,
+          re.search(r'<title>[^<]*', body).group(0) if body else 'no page')
+    shutil.rmtree(os.path.dirname(h), ignore_errors=True)
+
+    # product2 — the hook's own output repeated its last section three times and
+    # the middle one twice: three overlapping sed ranges, each printing to
+    # end-of-file. A hook nobody can read is a hook nobody reads.
+    hook = os.path.join(ROOT, 'hooks', 'post-commit')
+    if os.path.isfile(hook):
+        code = [l for l in open(hook).read().split('\n')
+                if not l.lstrip().startswith('#')]
+        check('product2 · the commit hook does not repeat its own output',
+              not any(l.count(',$p') > 1 for l in code),
+              'overlapping sed ranges remain')
+
+    # product2 — adopt stamps the templates; update copied them unstamped, so a
+    # stamped brain silently went back to carrying the placeholder.
+    u = synthetic_brain('brain-stamp-')
+    tdir = os.path.join(u, 'knowledge-catalog', 'reference', 'agent-skills',
+                        'templates')
+    if os.path.isdir(tdir):
+        for f in os.listdir(tdir):
+            if not f.endswith('.md'):
+                continue
+            fp = os.path.join(tdir, f)
+            open(fp, 'w').write(re.sub(r'^timestamp: ".*"$',
+                                       'timestamp: "2024-01-01"',
+                                       open(fp).read(), flags=re.M))
+    run([os.path.join(u, 'bin', 'update'), ROOT, '--target', u], u)
+    left = []
+    for base, dirs, files in os.walk(tdir if os.path.isdir(tdir) else u):
+        for f in files:
+            if f.endswith('.md') and '<YYYY-MM-DD>' in open(
+                    os.path.join(base, f)).read():
+                left.append(f)
+    check('product2 · an update leaves no <YYYY-MM-DD> in the templates',
+          not left, ', '.join(left[:3]))
+    shutil.rmtree(os.path.dirname(u), ignore_errors=True)
+
+    # Three rounds, three crashes or false passes from a fixture that read the
+    # host's own content: copytree(ROOT) with the Intent layer deleted, then a
+    # copy2 of the template's D0004, then a remove of .template-record. Each
+    # was made while fixing the previous one. A portability fixture cannot
+    # read ROOT, so this asserts it does not.
+    # product3 — bin/update replaced its own file and kept running the code Python
+    # had already loaded, so every fix to its own behaviour was unobservable in
+    # the release that shipped it. Two shipped looking broken.
+    up = open(B('bin', 'update'), encoding='utf-8').read()
+    check('product3 · bin/update re-execs the version it just installed',
+          'os.execve' in up and 'BRAIN_UPDATE_STAGED' in up)
+
+    # product4 — and compares upstream's bytes against what it last installed, not
+    # against the transformed local copy, which could never settle.
+    check('product4 · bin/update judges change against upstream, not the local copy',
+          'upstream_changed' in up and 'MANIFEST' in up)
+
+    # product3 — the handoff picked the wrong plan three times, each time by
+    # inferring from a convention that varied. `serves:` cannot discriminate
+    # because bin/lint requires it on every Approach node.
+    hp = synthetic_brain('brain-plan-')
+    _demo_initiative(hp, marker=True)
+    _, out = run([os.path.join(hp, 'bin', 'handoff'), 'demo',
+                  '--for', 'executive'], hp)
+    check('product3 · the handoff honours `initiative_plan: true` over the lowest id',
+          'P0105' in out and 'initiative_plan' in out, out[:200])
+    page = os.path.join(hp, 'plans', 'demo', 'handoff-executive.html')
+    body = open(page).read() if os.path.isfile(page) else ''
+    # product3 — a date the work turns on lived only in frontmatter nothing read,
+    # and INIT.md's answer was to hand-copy it into prose generated from it.
+    check('product3 · a plan\'s consent date reaches an outward handoff',
+          '2026-11-20' in body and 'Dates that matter' in body, body[:150])
+    # product4 — and an empty value produces no blank section.
+    check('product4 · an empty date field renders no section',
+          body.count('Dates that matter') == 1)
+    # product3 — "Not included" is a disclaimer; it preceded the authored prose.
+    order = re.findall(r'<h2[^>]*>([^<]*)', body)
+    check('product3 · "Not included" renders after the authored sections',
+          bool(order) and order[-1] == 'Not included', ' | '.join(order))
+    check('product3 · and the title comes from the initiative plan',
+          '<title>Demo</title>' in body,
+          (re.search(r'<title>[^<]*', body) or [''])[0])
+    shutil.rmtree(os.path.dirname(hp), ignore_errors=True)
+
+    # And with no marker at all, the guess announces itself as one.
+    hp2 = synthetic_brain('brain-plan2-')
+    _demo_initiative(hp2, marker=False)
+    _, out = run([os.path.join(hp2, 'bin', 'handoff'), 'demo',
+                  '--for', 'executive'], hp2)
+    check('product3 · with nothing to go on it says it is guessing',
+          'a guess' in out, out[:200])
+    # product4 — --plan took any path at all, including a task.
+    _, out = run([os.path.join(hp2, 'bin', 'handoff'), 'demo', '--for',
+                  'executive', '--plan', 'tasks/demo/T0100-x.md'], hp2)
+    check('product4 · --plan refuses a node that is not a plan',
+          'not a plan' in out.lower(), out[:200])
+    shutil.rmtree(os.path.dirname(hp2), ignore_errors=True)
+
+    # product4 — the recipe an adopter proposed, as a tool. Pointed at a command
+    # that writes nothing, it must find nothing; pointed at one that lies
+    # about a dry run, it must fail.
+    pv = synthetic_brain('brain-prove-')
+    code, out = run([os.path.join(pv, 'bin', 'prove'), '--no-dry', '--once',
+                     os.path.join(pv, 'bin', 'lint')], pv)
+    check('product4 · prove reports agreement for a tool that writes nothing',
+          code == 0 and 'agree' in out, out[-200:])
+    liar = os.path.join(pv, 'bin', 'liar')
+    open(liar, 'w').write(
+        '#!/bin/sh\necho "  --dry-run: nothing written."\n'
+        'echo tampered >> "$(dirname "$0")/../knowledge-catalog/log.md"\n')
+    os.chmod(liar, 0o755)
+    code, out = run([os.path.join(pv, 'bin', 'prove'), '--once', liar], pv)
+    check('product4 · and fails a dry run that writes',
+          code == 1 and 'dry run that writes' in out, out[-200:])
+    shutil.rmtree(os.path.dirname(pv), ignore_errors=True)
+
+    # product5 — prove's three defects, all in the recipe's own assumptions about
+    # --dry-run. The worst was a vacuous pass: a tool that *rejects* the flag
+    # writes nothing, so the assertion went green over a command that never
+    # ran. A false reassurance inside the tool built to catch those.
+    pv2 = synthetic_brain('brain-prove2-')
+    code, out = run([os.path.join(pv2, 'bin', 'prove'), '--once',
+                     os.path.join(pv2, 'bin', 'index')], pv2)
+    check('product5 · prove skips a tool with no --dry-run rather than passing',
+          'skip' in out and 'ok ] --dry-run' not in out, out[:220])
+    # And an announced derived file is not an idempotence violation: graph.html
+    # carries a second-resolution stamp, which made the assertion a coin flip —
+    # four failures in six identical attempts.
+    code, out = run([os.path.join(pv2, 'bin', 'prove'),
+                     os.path.join(pv2, 'bin', 'graph-build')], pv2)
+    check('product5 · and does not call an honest tool dishonest',
+          'dishonest' not in out, out[-200:])
+    shutil.rmtree(os.path.dirname(pv2), ignore_errors=True)
+
+    # product5 — the third class: a field the record carries that no tool reads.
+    ur = synthetic_brain('brain-unread-')
+    os.makedirs(os.path.join(ur, 'plans', 'demo'), exist_ok=True)
+    # Built rather than written, so this file's own source does not contain
+    # the name — bin/selftest mentioning `flag` was enough to satisfy the very
+    # check it was testing, which is the self-reference bug one level out.
+    probe = 'rollout' + '_cohort'
+    open(os.path.join(ur, 'plans', 'demo', 'P0001-x.md'), 'w').write(
+        '---\nid: P0001\ntype: plan\ntitle: "X"\ndescription: "d"\n'
+        'status: active\ninitiative: demo\n' + probe + ': nobody-reads-this\n'
+        'timestamp: "2024-01-01"\ntags: []\n---\n# Plan\nx\n')
+    code, out = run([os.path.join(ur, 'bin', 'unread')], ur)
+    check('product5 · unread finds a field written and read by nothing',
+          code == 1 and probe in out, out[:200])
+    shutil.rmtree(os.path.dirname(ur), ignore_errors=True)
+
+    # product5 — a decision constraining bin/** could not travel with the bin/**
+    # it governs, so an adopter was told nothing governed those paths.
+    tr = synthetic_brain('brain-travel-')
+    _, out = run([os.path.join(tr, 'bin', 'constraints'), 'bin/handoff'], tr)
+    check('product5 · an upstream invariant reaches a brain holding none of its nodes',
+          'D0011' in out and 'github.com' in out, out[:220])
+    shutil.rmtree(os.path.dirname(tr), ignore_errors=True)
+
+    # product6 — a typed frontmatter edge was never validated: `intent: ./intent.md`
+    # pointed at a file a migration had deleted and lint reported 0 errors. The
+    # README's own argument is that a typed edge is enumerable and a body link
+    # is a hope — and the linter was checking the hope.
+    ed = synthetic_brain('brain-edge-')
+    os.makedirs(os.path.join(ed, 'plans', 'demo'), exist_ok=True)
+    open(os.path.join(ed, 'plans', 'demo', 'P0001-x.md'), 'w').write(
+        '---\nid: P0001\ntype: plan\ntitle: "X"\ndescription: "d"\n'
+        'status: active\ninitiative: demo\nintent: ./intent.md\n'
+        'timestamp: "2024-01-01"\ntags: []\n---\n# Plan\nx\n')
+    code, out = run([os.path.join(ed, 'bin', 'lint')], ed)
+    check('product6 · an unresolvable typed edge is an error, not silence',
+          'intent: ./intent.md' in out and ' 0 errors' not in out, out[:220])
+    # And `constrains:` holds globs, not citations — treating them as paths
+    # reported three real decisions as broken.
+    check('product6 · and `constrains:` globs are not read as citations',
+          'constrains' not in out, out[:220])
+    shutil.rmtree(os.path.dirname(ed), ignore_errors=True)
+
+    # product6 — prove's second-resolution mtime made a rewrite to identical bytes
+    # invisible inside one second, which is the case its docstring argues for.
+    # Comments stripped: the comment explaining this fix quotes the old code,
+    # so a textual check on the whole file failed on its own rationale. Fourth
+    # self-reference bug in a session that keeps writing checks about text.
+    pv3 = '\n'.join(l for l in open(B('bin', 'prove'), encoding='utf-8')
+                    if not l.lstrip().startswith('#'))
+    check('product6 · prove times files to the nanosecond',
+          'st_mtime_ns' in pv3 and 'int(st.st_mtime)' not in pv3)
+
+    # product6 — a field read by *shape* had no evidence a text search could find,
+    # so `consent_by` passed only because a comment quoted it.
+    ur2 = synthetic_brain('brain-shape-')
+    os.makedirs(os.path.join(ur2, 'plans', 'demo'), exist_ok=True)
+    open(os.path.join(ur2, 'plans', 'demo', 'P0001-x.md'), 'w').write(
+        '---\nid: P0001\ntype: plan\ntitle: "X"\ndescription: "d"\n'
+        'status: active\ninitiative: demo\nconsent_by: "2026-11-20"\n'
+        'timestamp: "2024-01-01"\ntags: []\n---\n# Plan\nx\n')
+    code, out = run([os.path.join(ur2, 'bin', 'unread')], ur2)
+    check('product6 · a field read by declared shape is not reported dead',
+          code == 0 and 'consent_by' not in out, out[:200])
+    shutil.rmtree(os.path.dirname(ur2), ignore_errors=True)
+
+    # product6 — reconcile greps a bare id anywhere in a commit message, so two
+    # commits saying "numbering free at G0001/D0001/T0001" produced the verdict
+    # "Wrong, and the evidence is unambiguous: T0001 should be In Progress"
+    # over a task nobody had touched. Its first rule is that it never guesses.
+    rc = synthetic_brain('brain-recon-')
+    os.makedirs(os.path.join(rc, 'tasks', 'demo'), exist_ok=True)
+    for tid, title in (('T0042', 'started'), ('T0043', 'untouched')):
+        open(os.path.join(rc, 'tasks', 'demo', f'{tid}-x.md'), 'w').write(
+            f'---\nid: {tid}\ntype: task\ntitle: "A task {title}"\n'
+            'description: "d"\nstatus: Not Ready\ninitiative: demo\n'
+            'blocked_by: []\ntimestamp: "2024-01-01"\ntags: []\n---\n'
+            '# What to build\nx\n# Acceptance criteria\n- [ ] x\n'
+            '# Out of scope\n- x\n# Log\n')
+    host = os.path.dirname(rc)
+    for args in (['init', '-q', '.'], ['add', '-A']):
+        subprocess.run(['git'] + args, cwd=host, capture_output=True)
+    env = dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t',
+               GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@t')
+    subprocess.run(['git', 'commit', '-q', '-m', 'T0042: build the thing'],
+                   cwd=host, capture_output=True, env=env)
+    subprocess.run(['git', 'commit', '-q', '--allow-empty', '-m',
+                    'numbering free at G0001/D0001/T0043'],
+                   cwd=host, capture_output=True, env=env)
+    _, out = run([os.path.join(rc, 'bin', 'reconcile'), 'demo'], rc)
+    # Neither case earns "unambiguous": a commit message cannot distinguish
+    # doing a task from writing about one, so both go to the bucket a person
+    # reads. What differs is what it says it saw.
+    check('product6 · a commit-message id is never reported as unambiguous',
+          'unambiguous' not in out, out[:200])
+    check('product6 · a strong mention still surfaces, as a question',
+          'T0042' in out and 'started, or just discussed' in out, out[:300])
+    check('product6 · and a bare id in prose about ids says which it saw',
+          'T0043' in out and 'prose about identifiers' in out, out[:300])
+    # The output described a matching rule that had been reverted — "subject or
+    # first paragraph" when the matcher reads the whole message. A tool
+    # describing its own behaviour wrongly is the defect this suite exists for,
+    # and it survived one commit.
+    rsrc = open(B('bin', 'reconcile'), encoding='utf-8').read()
+    describes_paragraph = 'first paragraph' in rsrc.split('def judge')[-1]
+    reads_paragraph = 'first paragraph' in rsrc and 'head.append' in rsrc
+    check('product6 · reconcile does not describe a rule it does not apply',
+          not (describes_paragraph and not reads_paragraph),
+          'output claims subject-or-first-paragraph; matcher reads all of it')
+    shutil.rmtree(host, ignore_errors=True)
+
+    # consulting — the placeholder check matched any angle-bracket token, which on a
+    # real corpus is mostly content: an email as <someone@example.com>, an HTML
+    # <form>, a quoted example reading '<student> (1 of 8)'. Five errors, five
+    # false, zero real. Identity, not pattern.
+    gp = synthetic_brain('brain-placeholder-')
+    os.makedirs(os.path.join(gp, 'knowledge-catalog', 'decisions'), exist_ok=True)
+    open(os.path.join(gp, 'knowledge-catalog', 'decisions',
+                      'D0050-x.md'), 'w').write(
+        '---\nid: D0050\ntype: decision\ntitle: "Real content"\n'
+        'description: "Sessions read \'<student> (1 of 8)\' in the calendar."\n'
+        'timestamp: "2024-01-01"\ntags: []\nstatus: active\n---\n'
+        '# Context\nMail goes to <ops@example.com> and the <form> posts it.\n'
+        '# Decision\nx\n# Alternatives\nx\n# Consequences\nx\n')
+    _, out = run([os.path.join(gp, 'bin', 'lint')], gp)
+    check('consulting · angle-bracket content is not a scaffold placeholder',
+          'placeholder' not in out and 'scaffold' not in out, out[:220])
+    # And a token the templates really write is still caught.
+    with open(os.path.join(gp, 'knowledge-catalog', 'decisions',
+                           'D0050-x.md'), 'a') as fh:
+        fh.write('\nshipped <YYYY-MM-DD>\n')
+    _, out = run([os.path.join(gp, 'bin', 'lint')], gp)
+    check('consulting · but a real template token still is',
+          'YYYY-MM-DD' in out, out[:200])
+    shutil.rmtree(os.path.dirname(gp), ignore_errors=True)
+
+    # consulting — a bare `*_by` shape declaration also covered `decided_by: "Eli"`,
+    # a field with no reader at all, passing on a declaration that meant dates.
+    gu = synthetic_brain('brain-shapekind-')
+    os.makedirs(os.path.join(gu, 'knowledge-catalog', 'decisions'), exist_ok=True)
+    open(os.path.join(gu, 'knowledge-catalog', 'decisions',
+                      'D0051-x.md'), 'w').write(
+        '---\nid: D0051\ntype: decision\ntitle: "X"\ndescription: "d"\n'
+        'timestamp: "2024-01-01"\ntags: []\nstatus: active\n'
+        + ('decided' + '_by') + ': "a person, not a date"\n'
+        + ('consent' + '_by') + ': "2026-11-20"\n---\n'
+        '# Context\nx\n# Decision\nx\n# Alternatives\nx\n# Consequences\nx\n')
+    code, out = run([os.path.join(gu, 'bin', 'unread')], gu)
+    person_field, date_field = 'decided' + '_by', 'consent' + '_by'
+    check('consulting · a date-shaped declaration does not cover a non-date field',
+          code == 1 and person_field in out, out[:220])
+    check('consulting · and still covers the date field it was written for',
+          date_field not in out, out[:220])
+    shutil.rmtree(os.path.dirname(gu), ignore_errors=True)
+
+    # consulting — a consulting brain holds 23 decisions and zero plans, because
+    # intent arrives from outside as prose. Every task read UNTERMINATED and
+    # the operator stopped running ancestry. A decision is Intent too.
+    ga = synthetic_brain('brain-consult-')
+    os.makedirs(os.path.join(ga, 'tasks', 'consult'), exist_ok=True)
+    open(os.path.join(ga, 'knowledge-catalog', 'decisions',
+                      'D0200-client.md'), 'w').write(
+        '---\nid: D0200\ntype: decision\ntitle: "The client set this"\n'
+        'description: "d"\ntimestamp: "2026-11-01"\ntags: []\n'
+        'status: active\n---\n# Context\nx\n# Decision\nx\n'
+        '# Alternatives\nx\n# Consequences\nx\n')
+    open(os.path.join(ga, 'tasks', 'consult', 'T0300-x.md'), 'w').write(
+        '---\nid: T0300\ntype: task\ntitle: "Do it"\ndescription: "d"\n'
+        'status: Ready for Development\ninitiative: consult\n'
+        'serves: ../../knowledge-catalog/decisions/D0200-client.md\n'
+        'blocked_by: []\ntimestamp: "2026-11-02"\ntags: []\n---\n'
+        '# What to build\nx\n# Acceptance criteria\n- [ ] x\n'
+        '# Out of scope\n- x\n# Log\n')
+    _, out = run([os.path.join(ga, 'bin', 'lint')], ga)
+    check('consulting · a task may serve a decision, not only a goal',
+          ' 0 errors' in out, out.strip()[-200:])
+    _, out = run([os.path.join(ga, 'bin', 'ancestry'), 'T0300'], ga)
+    check('consulting · and the lineage terminates there rather than UNTERMINATED',
+          'UNTERMINATED' not in out and 'on a decision, not a goal' in out,
+          out[:220])
+    shutil.rmtree(os.path.dirname(ga), ignore_errors=True)
+
+    # consulting — a brain owning every id the template ships got "no decision
+    # governs these paths" with no hint that an invariant existed and had been
+    # suppressed. Correct precedence, wrong report.
+    gsup = synthetic_brain('brain-suppress-')
+    open(os.path.join(gsup, 'knowledge-catalog', 'decisions',
+                      'D0011-theirs.md'), 'w').write(
+        '---\nid: D0011\ntype: decision\ntitle: "Ours, same id"\n'
+        'description: "d"\ntimestamp: "2024-01-01"\ntags: []\n'
+        'status: active\n---\n# Context\nx\n# Decision\nx\n'
+        '# Alternatives\nx\n# Consequences\nx\n')
+    _, out = run([os.path.join(gsup, 'bin', 'constraints'), 'bin/handoff'], gsup)
+    check('consulting · a suppressed upstream invariant is named, not hidden',
+          'suppressed' in out, out[:240])
+    # The census note fires only when the query found nothing, so ask about a
+    # path no shipped invariant governs. Querying `bin/handoff` worked until a
+    # new decision declared it, at which point the fixture was asserting the
+    # absence of a message the tool was right not to print.
+    _, out = run([os.path.join(gsup, 'bin', 'constraints'),
+                  'src/unrelated/widget.py'], gsup)
+    check('consulting · and an empty constrains corpus says it has no data',
+          'almost nothing to answer with' in out, out[:300])
+    shutil.rmtree(os.path.dirname(gsup), ignore_errors=True)
+
+    # Ceremony — an adopter measured the brain's overhead at 15-25% per change
+    # and located it: "writing is cheap, choosing the category is the cost and
+    # has no tool." These are that tool, and the checkable claim is that a
+    # capture needs no type and leaves the gate clean.
+    nb = synthetic_brain('brain-note-')
+    code, out = run([os.path.join(nb, 'bin', 'note'),
+                     'client says 24h cancellation, not 48'], nb)
+    check('Ceremony · a note is captured with no type chosen',
+          code == 0 and 'no type chosen' in out, out[:200])
+    _, out = run([os.path.join(nb, 'bin', 'lint')], nb)
+    check('Ceremony · and leaves the gate clean, unlike a scaffolded node',
+          ' 0 errors' in out, out.strip()[-200:])
+    # The comparison that makes the claim checkable rather than asserted.
+    _, out = run([os.path.join(nb, 'bin', 'new'), 'evidence', 'A thing'], nb)
+    _, out = run([os.path.join(nb, 'bin', 'lint')], nb)
+    check('Ceremony · a scaffolded evidence node does not, which is the point',
+          ' 0 errors' not in out, out.strip()[-160:])
+    # A note must never land in a topical record that merely looks like a
+    # journal: picking by shape sent one into this brain's own E0001.
+    marked = [f for f in os.listdir(os.path.join(nb, 'knowledge-catalog',
+                                                 'reference'))
+              if f.endswith('.md') and 'notes: true' in
+              open(os.path.join(nb, 'knowledge-catalog', 'reference', f)).read()]
+    check('Ceremony · the notes record is found by a declared marker',
+          len(marked) == 1, f'{len(marked)} marked record(s)')
+    _, out = run([os.path.join(nb, 'bin', 'note'), '--review'], nb)
+    check('Ceremony · and an unclassified entry can be found again',
+          'cancellation' in out, out[:200])
+    _, out = run([os.path.join(nb, 'bin', 'which'), '--table'], nb)
+    check('Ceremony · the type question has a procedure, not a shrug',
+          'evidence' in out and 'not a node' in out, out[:160])
+    shutil.rmtree(os.path.dirname(nb), ignore_errors=True)
+
+    # consulting — they kept `decided_by` on a considered argument and no tool
+    # reads it, so bin/unread would have failed their CI on every run forever:
+    # the permanently-red check this record had already paid to learn about.
+    hf = synthetic_brain('brain-human-')
+    field = 'decided' + '_by'
+    open(os.path.join(hf, 'knowledge-catalog', 'decisions',
+                      'D0300-x.md'), 'w').write(
+        '---\nid: D0300\ntype: decision\ntitle: "X"\ndescription: "d"\n'
+        'timestamp: "2024-01-01"\ntags: []\nstatus: active\n'
+        + field + ': "Ashlee, against the data, knowingly"\n---\n'
+        '# Context\nx\n# Decision\nx\n# Alternatives\nx\n# Consequences\nx\n')
+    code, out = run([os.path.join(hf, 'bin', 'unread')], hf)
+    check('Ceremony · an undeclared human-only field is still reported',
+          code == 1 and field in out, out[:200])
+    cfg = os.path.join(hf, 'config.md')
+    t = open(cfg).read().replace('human_fields: []', f'human_fields: [{field}]')
+    open(cfg, 'w').write(t)
+    code, out = run([os.path.join(hf, 'bin', 'unread')], hf)
+    check('Ceremony · and declaring it answers the check rather than breaking it',
+          code == 0 and 'read by people' in out, out[:220])
+    shutil.rmtree(os.path.dirname(hf), ignore_errors=True)
+
+    # consulting2 — classification fell to ~5% and the cost moved to retrieval,
+    # which scales with the record where classification is flat per item.
+    # Their ask was exact: bin/relevant returning a line number.
+    rl = synthetic_brain('brain-relevant-')
+    target = os.path.join(rl, 'knowledge-catalog', 'decisions', 'D0400-x.md')
+    open(target, 'w').write(
+        '---\nid: D0400\ntype: decision\ntitle: "Cancellation window"\n'
+        'description: "d"\ntimestamp: "2024-01-01"\ntags: []\n'
+        'status: active\n---\n# Context\nx\n# Decision\n'
+        'Cancellations inside twentyfour hours are billed in full.\n'
+        '# Alternatives\nx\n# Consequences\nx\n')
+    _, out = run([os.path.join(rl, 'bin', 'relevant'), 'cancellations billed'], rl)
+    m = re.search(r'D0400-x\.md:(\d+)', out)
+    check('consulting2 · relevant cites a line number, not just a path',
+          bool(m), out[:220])
+    if m:
+        want = open(target).read().split('\n')[int(m.group(1)) - 1]
+        check('consulting2 · and the number lands on the line it quoted',
+              'twentyfour' in want, f'line {m.group(1)} is {want!r}')
+    shutil.rmtree(os.path.dirname(rl), ignore_errors=True)
+
+    # consulting2 — "told to you" typed a client's scope decision as evidence, and
+    # bin/constraints only works on it because it is filed as a decision.
+    wt = open(B('bin', 'which'), encoding='utf-8').read()
+    first = wt[wt.index('LADDER = ['):]
+    check('consulting2 · the binding test is asked before the happened test',
+          first.index("'decision'") < first.index("'evidence'"),
+          'evidence is still asked first')
+
+    # T0001 — relevant printed every decision on every call as a backstop
+    # against its own term matching. Four lines at seventeen, a wall at eighty,
+    # and it stopped working exactly when the record was big enough to need it.
+    tb = synthetic_brain('brain-backstop-')
+    folder = os.path.join(tb, 'knowledge-catalog', 'decisions')
+    for n in range(1, 10):
+        governs = ('constrains:\n  - bin/widget\n' if n <= 7 else '')
+        open(os.path.join(folder, f'D0{n:03d}-x.md'), 'w').write(
+            f'---\nid: D0{n:03d}\ntype: decision\ntitle: "Decision {n}"\n'
+            'description: "d"\ntimestamp: "2024-01-01"\ntags: []\n'
+            f'status: active\n{governs}---\n# Context\nx\n# Decision\n'
+            'x\n# Alternatives\nx\n# Consequences\nx\n')
+    _, out = run([os.path.join(tb, 'bin', 'relevant'), 'widget throughput'], tb)
+    listed = len(re.findall(r'^    D0\d{3}  ', out, re.M))
+    check('T0001 · relevant no longer prints every decision',
+          listed < 9, f'{listed} of 9 listed')
+    check('T0001 · and reports how many declare no constrains',
+          'declare none' in out or 'declares none' in out, out[-300:])
+    # The ones it does list are exactly those no tool can reach.
+    check('T0001 · the list is the decisions nothing can surface',
+          listed == 2, f'{listed} listed, expected the 2 without constrains')
+    shutil.rmtree(os.path.dirname(tb), ignore_errors=True)
+
+    # research — two live tasks carried `spec: <optional relative link to …>` and
+    # the gate waved them through: check_placeholders read only title and
+    # description, check_edges filtered to values ending `.md`. Two checks,
+    # each declining to look where the other did not. An adopter found them by
+    # predicting lint errors that were absent and asking why.
+    hp = synthetic_brain('brain-ph-')
+    os.makedirs(os.path.join(hp, 'tasks', 'voice'), exist_ok=True)
+    tmpl = os.path.join(hp, 'knowledge-catalog', 'reference', 'agent-skills',
+                        'templates', 'task.md')
+    token = ''
+    if os.path.isfile(tmpl):
+        m = re.search(r'^spec:\s*(<[^>\n]+>)', open(tmpl).read(), re.M)
+        token = m.group(1) if m else ''
+    open(os.path.join(hp, 'tasks', 'voice', 'T0500-x.md'), 'w').write(
+        '---\nid: T0500\ntype: task\ntitle: "Real title"\n'
+        'description: "Real prose."\nstatus: Not Ready\ninitiative: voice\n'
+        f'spec: {token}\nblocked_by: []\ntimestamp: "2024-01-01"\n'
+        'tags: []\n---\n# What to build\nx\n# Acceptance criteria\n'
+        '- [ ] x\n# Out of scope\n- x\n# Log\n')
+    _, out = run([os.path.join(hp, 'bin', 'lint')], hp)
+    check('research · a scaffold token in any frontmatter field is an error',
+          'spec:' in out and ' 0 errors' not in out, out.strip()[-200:])
+    shutil.rmtree(os.path.dirname(hp), ignore_errors=True)
+
+    # research — `bin/note --review` with no record at all reported that every entry
+    # had been promoted or deliberately left: a claim about a backlog that had
+    # never existed, from a tool built to make claims checkable.
+    nr = synthetic_brain('brain-review-')
+    _, out = run([os.path.join(nr, 'bin', 'note'), '--review'], nr)
+    check('research · review does not claim a promoted backlog that never existed',
+          'No notes record yet' in out and 'promoted' not in out, out[:200])
+    shutil.rmtree(os.path.dirname(nr), ignore_errors=True)
+
+    # research — bin/which fell back to the seven-question table whenever stdin was
+    # not a tty, so an agent could never reach the two-question ladder. The
+    # main caller of every tool here is an agent.
+    wb = synthetic_brain('brain-which-')
+    _, out = run([os.path.join(wb, 'bin', 'which'), 'n', 'y'], wb)
+    check('research · an agent can walk the ladder without a tty',
+          '→ evidence' in out and 'First yes wins' not in out, out[:200])
+    _, out = run([os.path.join(wb, 'bin', 'which'), 'y'], wb)
+    check('research · and the first yes still wins on the binding test',
+          '→ decision' in out, out[:160])
+    shutil.rmtree(os.path.dirname(wb), ignore_errors=True)
+
+    # G0001's third signal: an agent given only CLAUDE.md places a node
+    # correctly without the operator naming anything. It was unmet and nothing
+    # measured it — so measure the half that is mechanical.
+    #
+    # Twelve fields the toolchain reads were never named in CLAUDE.md, among
+    # them `serves`, `constrains`, `invariant`, `blocked_by` and `category`.
+    # An agent reading only that file cannot know they exist, which is exactly
+    # what three corpora show: invented fields (`supersedes`, `intent:`,
+    # `owner`) and `constrains:` on 1 of 23 decisions. Not carelessness — the
+    # vocabulary was absent from the one file they were told to read.
+    #
+    # Sources are the templates and lint's own edge table, so this cannot be
+    # satisfied by editing a list next to the check.
+    claude = open(B('CLAUDE.md'), encoding='utf-8').read()
+    declared = set()
+    tdir = os.path.join(brain, 'knowledge-catalog', 'reference',
+                        'agent-skills', 'templates')
+    if os.path.isdir(tdir):
+        for f in sorted(os.listdir(tdir)):
+            if not f.endswith('.md'):
+                continue
+            text = open(os.path.join(tdir, f), encoding='utf-8').read()
+            head = text[3:text.find('\n---', 3)] if text.startswith('---') else ''
+            declared |= {l.split(':')[0].strip() for l in head.split('\n')
+                         if ':' in l and not l.startswith((' ', '#', '-'))}
+    lintsrc = open(B('bin', 'lint'), encoding='utf-8').read()
+    m = re.search(r'EDGE_TARGETS = \{(.*?)\n\}', lintsrc, re.S)
+    if m:
+        declared |= set(re.findall(r"'([a-z_]+)':", m.group(1)))
+    # The universals every template carries and every reader knows.
+    declared -= {'id', 'type', 'title', 'description', 'status', 'timestamp',
+                 'tags', 'initiative'}
+    unnamed = sorted(f for f in declared if f and f not in claude)
+    check('G0001 · every field a tool reads is named in CLAUDE.md',
+          not unnamed, f'{len(unnamed)} unreachable: {unnamed[:6]}')
+
+    # solo — bin/adopt silently rewrote graph.html on a second run, which is how
+    # a fourth adopter's very first bin/prove invocation failed. Root cause was
+    # one line: graph-build wrote unconditionally, though --check had always
+    # compared modulo the timestamp. Two earlier fixes treated symptoms of it.
+    gb = synthetic_brain('brain-graph-')
+    run([os.path.join(gb, 'bin', 'graph-build')], gb)
+    out1 = os.path.join(gb, 'graph.html')
+    sig = os.stat(out1).st_mtime_ns
+    _, out = run([os.path.join(gb, 'bin', 'graph-build')], gb)
+    check('solo . graph-build does not rewrite an unchanged graph',
+          os.stat(out1).st_mtime_ns == sig and 'already current' in out,
+          out[:160])
+    shutil.rmtree(os.path.dirname(gb), ignore_errors=True)
+
+    # The same comparison, from the other side. graph.html embeds each node's
+    # filesystem mtime, and `git clone` stamps every file with the moment of
+    # checkout -- so a committed graph could only ever match on the machine
+    # that built it. `bin/graph-build --check` is the CI step "graph is
+    # current", which means that step failed on every fresh clone, for every
+    # adopter, and the README's CI table promised it passing. Found when a
+    # history rewrite reset every mtime and the check went red with no content
+    # changed. Comparison now ignores mtime, which is display metadata.
+    gb = synthetic_brain('brain-mtime-')
+    run([os.path.join(gb, 'bin', 'graph-build')], gb)
+    later = os.path.getmtime(os.path.join(gb, 'graph.html')) + 86400
+    for root, _, names in os.walk(gb):
+        if '.git' in root:
+            continue
+        for n in names:
+            if n.endswith('.md'):
+                os.utime(os.path.join(root, n), (later, later))
+    code, out = run([os.path.join(gb, 'bin', 'graph-build'), '--check'], gb)
+    check('solo . --check survives the mtimes a fresh clone stamps',
+          code == 0, out.strip()[:160])
+
+    # Same defect, second carrier. The graph is titled `<parent dir> · brain`
+    # in both the <title> and the <h1>, so a checkout at
+    # /home/runner/work/brain/brain and one at ~/Source/brain disagree about a
+    # file neither changed. Moving the brain is what a clone does, so this is
+    # checked by moving it.
+    moved = os.path.join(os.path.dirname(os.path.dirname(gb)),
+                         'elsewhere-' + os.path.basename(os.path.dirname(gb)))
+    os.makedirs(moved, exist_ok=True)
+    dest = os.path.join(moved, os.path.basename(gb))
+    shutil.move(gb, dest)
+    code, out = run([os.path.join(dest, 'bin', 'graph-build'), '--check'], dest)
+    check('solo . and the directory the brain was checked out into',
+          code == 0, out.strip()[:160])
+    shutil.rmtree(moved, ignore_errors=True)
+    shutil.rmtree(os.path.dirname(gb), ignore_errors=True)
+
+    # solo — bin/utterances --repeated ranked a teammate agent's idle JSON as the
+    # operator's most-repeated statement, labelled [typed]. INIT.md tells a
+    # migrator to mine that ranking for the operator's own words, so the tool
+    # INIT recommends was supplying the laundering INIT forbids.
+    import importlib.util as _ilu
+    from importlib.machinery import SourceFileLoader as _SFL
+    spec = _ilu.spec_from_loader('_utt', _SFL('_utt', B('bin', 'utterances')))
+    utt = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(utt)
+    machine = '{"event":"idle","agent":"teammate-3","session":"abc"}'
+    human = 'we should remove the lineage section, those are real company names'
+    check('solo . a machine payload is not the operator speaking',
+          utt.is_injected(machine))
+    check('solo . and a real sentence still is',
+          not utt.is_injected(human))
+
+    # solo — "embedded but gitignored" is a real arrangement the docs never
+    # named, and nothing flagged that its whole premise, co-versioning, was
+    # absent. doctor said sound because soundness is about the install.
+    gi = synthetic_brain('brain-ignored-')
+    host = os.path.dirname(gi)
+    cfg = os.path.join(gi, 'config.md')
+    # Read, then write. `open(cfg, 'w')` truncates before the inner read
+    # evaluates, so the one-liner emptied config.md and doctor read a brain
+    # with no mode at all — the fixture silently testing something else.
+    text = open(cfg, encoding='utf-8').read()
+    open(cfg, 'w', encoding='utf-8').write(
+        text.replace('mode: template', 'mode: embedded'))
+    subprocess.run(['git', 'init', '-q', '.'], cwd=host, capture_output=True)
+    open(os.path.join(host, '.gitignore'), 'w').write(
+        os.path.basename(gi) + '/\n')
+    _, out = run([os.path.join(gi, 'bin', 'doctor')], gi)
+    check('solo . an embedded brain the host ignores is flagged',
+          'co-versioned' in out, out[-200:])
+    shutil.rmtree(host, ignore_errors=True)
+
+    # solo — an invariant that was false the day it was written passed lint and
+    # a clean bin/stale. Nothing verifies one, so the tool that surfaces them
+    # has to say so rather than implying they are checked.
+    cs = open(B('bin', 'constraints'), encoding='utf-8').read()
+    check('solo . constraints says an invariant is surfaced, never verified',
+          'never verified' in cs)
+
+    # solo2 — bin/adopt inserts brain_revision when the key is absent and
+    # bin/update never learned to, so an install predating the field could not
+    # gain it through the tool that population actually uses. One adopter
+    # updated and still had no revision recorded, which also disabled the
+    # "already current at <rev>" short-circuit for them without a word.
+    rv = synthetic_brain('brain-rev-')
+    cfg = os.path.join(rv, 'config.md')
+    text = open(cfg, encoding='utf-8').read()
+    open(cfg, 'w', encoding='utf-8').write(
+        re.sub(r'^brain_revision:.*$', '', text, flags=re.M))
+    # The revision comes from `git rev-parse` in the source, so a brain whose
+    # source is not a git repository has nothing to record. Eighth instance of
+    # the precondition-versus-assertion confusion: skip when the precondition
+    # is absent, fail when the assertion is false.
+    src_git = subprocess.run(['git', '-C', ROOT, 'rev-parse', '--short', 'HEAD'],
+                             capture_output=True)
+    if src_git.returncode != 0:
+        skip('solo2 . update records the revision even when the key was absent',
+             'the source brain is not a git repository, so there is no '
+             'revision for an update to record')
+    else:
+        run([os.path.join(rv, 'bin', 'update'), ROOT, '--target', rv], rv)
+        after = open(cfg, encoding='utf-8').read()
+        check('solo2 . update records the revision even when the key was absent',
+              re.search(r'^brain_revision: "[0-9a-f]{6,}"', after, re.M)
+              is not None, after[:200])
+    shutil.rmtree(os.path.dirname(rv), ignore_errors=True)
+
+    # solo3 — update's report was a list of intentions, so it was wrong in both
+    # directions: it undercounted by every file the post-copy transforms wrote
+    # (re-stamp, citation repoint, config merge) and overcounted whenever a
+    # copy was decided and made no difference. Three fixes to the reporting
+    # layer did not hold because the report was never a measurement.
+    #
+    # An adopter also found the blind spot that hid it: bin/prove tests from
+    # current state, so a false claim made by the updating run is invisible
+    # unless you snapshot beforehand. The tool snapshots itself now.
+    up = open(B('bin', 'update'), encoding='utf-8').read()
+    check('solo3 . update reports a measurement, not an intention',
+          'def snapshot(' in up and 'measured by content' in up)
+    # The measurement has to be taken after the transforms, not before.
+    body = up[up.index('def main('):]
+    check('solo3 . and takes it after the transforms, not before',
+          body.index('after = snapshot(ROOT)') > body.index('--repoint-only'),
+          'the after-snapshot precedes the repoint')
+
+    # solo3 — --repeated reported statements said exactly once as the operator's
+    # most-repeated. The measure was containment, len(a & b) / min(|a|, |b|),
+    # so any short message whose words all appear in a long one scored 1.0 and
+    # was counted as a repetition of it. The inflation grew with the length of
+    # the longest message in the project.
+    import importlib.util as _ilu2
+    from importlib.machinery import SourceFileLoader as _SFL2
+    spec2 = _ilu2.spec_from_loader('_utt2', _SFL2('_utt2', B('bin', 'utterances')))
+    utt2 = _ilu2.module_from_spec(spec2)
+    spec2.loader.exec_module(utt2)
+
+    short = utt2.content_words('push the branch now')
+    longm = utt2.content_words(
+        'push the branch now and then review the linter output carefully '
+        'because the gate reported several warnings about citations and '
+        'placeholders that nobody has looked at since the migration landed')
+    contained = len(short & longm) / max(1, min(len(short), len(longm)))
+    jaccard = len(short & longm) / max(1, len(short | longm))
+    check('solo3 . a short message inside a long one is not a repetition of it',
+          contained > 0.9 and jaccard < 0.55,
+          f'containment {contained:.2f}, jaccard {jaccard:.2f}')
+
+    a = utt2.content_words('keep the record honest about what it cannot check')
+    b = utt2.content_words('the record should stay honest about what it cannot check')
+    check('solo3 . but a genuine restatement still groups',
+          len(a & b) / max(1, len(a | b)) >= 0.55)
+
+    usrc = open(B('bin', 'utterances'), encoding='utf-8').read()
+    check('solo3 . and the measure in the tool is the symmetric one',
+          'len(wi | wj)' in usrc and 'min(len(wi), len(wj))' not in usrc)
+
+    # D0013 — four of five brains have no Approach layer at all. Three
+    # adopters each worked out alone that it was optional, and one abandoned
+    # bin/ancestry because every task read UNTERMINATED. No tool may require
+    # one, and the documents must say so rather than leaving it to be
+    # rediscovered.
+    ap = synthetic_brain('brain-approach-')
+    os.makedirs(os.path.join(ap, 'tasks', 'work'), exist_ok=True)
+    open(os.path.join(ap, 'knowledge-catalog', 'decisions',
+                      'D0600-x.md'), 'w').write(
+        '---\nid: D0600\ntype: decision\ntitle: "Told, not chosen"\n'
+        'description: "d"\ntimestamp: "2026-01-01"\ntags: []\n'
+        'status: active\n---\n# Context\nx\n# Decision\nx\n'
+        '# Alternatives\nx\n# Consequences\nx\n')
+    open(os.path.join(ap, 'tasks', 'work', 'T0600-x.md'), 'w').write(
+        '---\nid: T0600\ntype: task\ntitle: "Do it"\ndescription: "d"\n'
+        'status: Ready for Development\ninitiative: work\n'
+        'serves: ../../knowledge-catalog/decisions/D0600-x.md\n'
+        'blocked_by: []\ntimestamp: "2026-01-02"\ntags: []\n---\n'
+        '# What to build\nx\n# Acceptance criteria\n- [ ] x\n'
+        '# Out of scope\n- x\n# Log\n')
+    _, out = run([os.path.join(ap, 'bin', 'lint')], ap)
+    check('D0013 . a brain with no Approach layer lints clean',
+          ' 0 errors' in out, out.strip()[-200:])
+    _, out = run([os.path.join(ap, 'bin', 'ancestry'), 'T0600'], ap)
+    check('D0013 . and its lineage terminates without a plan',
+          'UNTERMINATED' not in out, out[:200])
+    claude = open(os.path.join(ap, 'CLAUDE.md'), encoding='utf-8').read()
+    check('D0013 . and the documents say Approach is optional',
+          'optional' in claude.split('Action')[0], 'not marked in the table')
+    shutil.rmtree(os.path.dirname(ap), ignore_errors=True)
+
+    # D0013 — the forward skill path was written spec-first, so for the four
+    # of five brains with no Approach layer the "read the intent before
+    # cutting tasks" step had no instruction at all, and the task template
+    # offered no typed lineage edge. Text assertions about documents, which
+    # is a weak kind of check — said plainly rather than dressed up.
+    tt = open(B('skills', 'to-tasks', 'SKILL.md'), encoding='utf-8').read()
+    check('D0013 . to-tasks tells you what to read when there is no spec',
+          'bin/relevant' in tt and 'bin/constraints' in tt,
+          'step 1b still assumes a spec')
+    check('D0013 . and its task template offers serves: as the lineage edge',
+          'serves: ../../knowledge-catalog/decisions/' in tt,
+          'template offers only spec:')
+    cm = open(B('CLAUDE.md'), encoding='utf-8').read()
+    forward = cm[cm.index('**Forward**'):cm.index('**Forward**') + 400]
+    check('D0013 . and the forward path marks to-spec optional',
+          '(`/to-spec`)' in forward, forward[:120])
+
+    # D0014 — the brain may point outside the repository and confirm a file is
+    # there; it may not vouch for what the file says. The existence half is
+    # real behaviour and was verified before the decision was written, not
+    # assumed from reading the code.
+    xb = synthetic_brain('brain-boundary-')
+    host = os.path.dirname(xb)
+    os.makedirs(os.path.join(host, 'outside'), exist_ok=True)
+    open(os.path.join(host, 'outside', 'real.md'), 'w').write('real\n')
+    node = os.path.join(xb, 'knowledge-catalog', 'reference', 'E0900-ext.md')
+    def ext(target):
+        open(node, 'w').write(
+            '---\nid: E0900\ntype: evidence\ntitle: "Points outside"\n'
+            'description: "d"\ntimestamp: "2026-01-01"\ntags: []\n'
+            f'status: active\nresource: ../../../outside/{target}\n---\n'
+            '# What was observed\nx\n')
+    ext('real.md')
+    _, out = run([os.path.join(xb, 'bin', 'lint')], xb)
+    check('D0014 . an external artifact that exists is accepted',
+          'E0900' not in out.replace('index.md', ''), out[:200])
+    ext('missing.md')
+    _, out = run([os.path.join(xb, 'bin', 'lint')], xb)
+    check('D0014 . and one that does not is an error',
+          'does not resolve' in out and 'E0900' in out, out[:200])
+    cm = open(os.path.join(xb, 'CLAUDE.md'), encoding='utf-8').read()
+    check('D0014 . and the limit is stated where a reader meets it',
+          'describes one repository' in cm and 'verifies' in cm,
+          'CLAUDE.md does not state the boundary')
+    shutil.rmtree(host, ignore_errors=True)
+
+    # G0002 is deliberately not checked here. Whether *this* brain's record
+    # contains a goal about value is a fact about our content, and selftest
+    # asserts that the tooling behaves — holding an adopter's catalog to the
+    # shape of ours is the host-dependence mistake this suite has made seven
+    # times. `bin/adopt` also relocates goals into example/, so the installed
+    # brain has none by design, and the first version of this check failed for
+    # that reason rather than for being wrong about anything.
+
+    # T0002 — a task three conversations decided against sat at
+    # "Ready for Development" on the claimable frontier, where any agent
+    # running bin/status would pick it up. wontfix is the mechanism; the
+    # reasoning belongs in the node, not in a chat log.
+    _, out = run([B('bin', 'status'), 'formalize'], brain)
+    frontier = out.split('frontier (claimable now):')[-1]
+    check('T0002 . a wontfix task is off the claimable frontier',
+          'T0002' not in frontier, frontier[:160])
+
+    # T0004 — adding a count meant editing Python, so a project wanting
+    # "pages" or "tests" checked went without. An adopter then wrote an
+    # invariant claiming every resume PDF is at most two pages; one was three,
+    # and bin/stale said nothing contradicted the repository because `pages`
+    # was not a noun it could be taught.
+    fx = synthetic_brain('brain-facts-')
+    host = os.path.dirname(fx)
+    cfg = os.path.join(fx, 'config.md')
+    txt = open(cfg, encoding='utf-8').read()
+    open(cfg, 'w', encoding='utf-8').write(
+        txt.replace('mode: template', 'mode: embedded'))
+    os.makedirs(os.path.join(host, 'docs'), exist_ok=True)
+    open(os.path.join(host, 'docs', 'p.txt'), 'w').write('a\nb\nc\n')
+    open(os.path.join(fx, 'facts.md'), 'w').write(
+        '| noun | command |\n|---|---|\n'
+        "| pages | cat docs/p.txt | wc -l | tr -d ' ' |\n"
+        '| widgets | this-command-does-not-exist |\n')
+    open(os.path.join(fx, 'knowledge-catalog', 'decisions',
+                      'D0900-pages.md'), 'w').write(
+        '---\nid: D0900\ntype: decision\ntitle: "Short"\n'
+        'description: "d"\ntimestamp: "2026-01-01"\ntags: []\n'
+        'status: active\ninvariant: "Every resume PDF is at most 2 pages."\n'
+        '---\n# Context\nx\n# Decision\nx\n# Alternatives\nx\n'
+        '# Consequences\nx\n')
+    code, out = run([os.path.join(fx, 'bin', 'stale')], fx)
+    check('T0004 . a project declares a count without editing Python',
+          'pages' in out and '3' in out, out[:240])
+    check('T0004 . a command with a pipe is not truncated at the first one',
+          'pages  3' in out.replace('   ', '  '), out[:240])
+    check('T0004 . and a false invariant is caught by the declared fact',
+          code == 1 and 'says 2 pages; there are 3' in out, out[-300:])
+    check('T0004 . a command that cannot run is reported, not counted as zero',
+          'widgets' in out and 'expected a number' in out, out[:300])
+    os.remove(os.path.join(fx, 'facts.md'))
+    code, out = run([os.path.join(fx, 'bin', 'stale')], fx)
+    check('T0004 . and with no facts.md the built-ins still work',
+          'decisions' in out and 'pages' not in out, out[:200])
+    shutil.rmtree(host, ignore_errors=True)
+
+    # T0003 — the legend listed types alphabetically, which reads as an
+    # alphabet rather than as the model, and node labels carried the title
+    # only, so a node seen in the graph could not be quoted without opening
+    # it. These are assertions about generated source, because the behaviour
+    # lives in a browser; it was verified in one, and that is recorded in the
+    # task rather than claimed by a check that cannot see it.
+    gb = open(B('bin', 'graph-build'), encoding='utf-8').read()
+    check('T0003 . the legend groups by the four categories, in order',
+          re.search(r"CATEGORY = \{\s*\n\s*intent:.*\n\s*approach:.*\n"
+                    r"\s*action:.*\n\s*evidence:", gb) is not None,
+          'no ordered category map')
+    check('T0003 . a node label is prefixed with its id',
+          "return id ? `${id} ${short}`" in gb, 'titleOf does not prefix the id')
+    # One map, used by both, so the picture and the search cannot disagree
+    # about what a category contains.
+    after = gb[gb.index('const CATEGORY ='):]
+    check('T0003 . and the filter resolves categories from that same map',
+          'CATEGORY[q]' in after, 'the filter has its own idea of a category')
+
+    # D0013 enforced against the documents, not only the tools. Its invariant
+    # has two halves — "no tool requires an Approach node, and **no document
+    # implies one is expected**" — and the second half was violated by
+    # knowledge-catalog/howto.md for a full day after the decision was
+    # written. CLAUDE.md and the README were corrected; howto.md carried the
+    # same table unmarked and nothing compared them.
+    #
+    # Narrow on purpose: any generic document naming the four categories must
+    # mark Approach optional. It cannot check that two documents agree in
+    # general, which is a class with no instrument.
+    #
+    # The leading character is part of the pattern because the README stated
+    # the categories as a table and then as a bullet list. Matching only `|`
+    # meant the rewrite dropped this check from the run with no failure --
+    # 149 assertions became 148 and nothing said so. A guard that stops
+    # applying is worse than one that was never written, so the generic
+    # documents are counted as well as read.
+    seen = 0
+    for name in ('README.md', 'CLAUDE.md',
+                 os.path.join('knowledge-catalog', 'howto.md')):
+        path = B(name)
+        if not os.path.isfile(path):
+            continue
+        text = open(path, encoding='utf-8').read()
+        row = re.search(r'^[|\-*]\s*\*\*Approach\*\*(.*)$', text, re.M)
+        if not row:
+            continue
+        seen += 1
+        check(f'D0013 . {name} does not imply Approach is expected',
+              'optional' in row.group(1).lower(), row.group(0)[:90])
+    check('D0013 . and every generic document still states the categories',
+          seen == 3, f'only {seen} of 3 carry an Approach row')
+
+    # D0004 amended 2026-11-11 — one entry point, still two steps. INIT.md
+    # used to hard-stop when config.md was absent and tell the operator to go
+    # run bin/adopt, which is exactly the state an operator is in when they
+    # have just been handed the URL and have nothing on disk. Pointing a cold
+    # agent at it produced a refusal, not an install.
+    init = open(B('INIT.md'), encoding='utf-8').read()
+    check('D0004 . INIT.md installs a brain that is not there yet',
+          'Step 0' in init and 'stop and say to run `bin/adopt`' not in init,
+          'INIT.md still refuses when config.md is absent')
+
+    # Placement is recorded, not inferred: config.md carries the mode and
+    # moving the files afterwards does not move the record of what they are.
+    # So the question has to come before anything is copied.
+    asked = init.find('Where should the brain live?')
+    copied = min((i for i in (init.find('git clone https://'),
+                              init.find('cp -R')) if i != -1), default=-1)
+    check('D0004 . and asks where it goes before copying anything',
+          asked != -1 and copied != -1 and asked < copied,
+          f'ask at {asked}, copy at {copied}')
+
+    # The README hands the operator a URL to paste and INIT.md clones a
+    # repository. They have to be the same repository, and the URL has to be
+    # the raw one -- a github.com/<o>/<r>/INIT.md path is not a GitHub path at
+    # all and 404s, which is how it was first written.
+    readme = open(B('README.md'), encoding='utf-8').read()
+    prompt = re.search(r'https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/\S*INIT\.md',
+                       readme)
+    cloned = re.search(r'https://github\.com/([^/]+)/([^/\s]+?)(?:\.git)?\s', init)
+    check('D0004 . the install prompt is a fetchable raw URL',
+          prompt is not None,
+          'README has no raw INIT.md URL to paste')
+    check('D0004 . and names the repository INIT.md then clones',
+          bool(prompt and cloned) and prompt.group(1, 2) == cloned.group(1, 2),
+          f'{prompt and prompt.group(1, 2)} vs {cloned and cloned.group(1, 2)}')
+
+    own = open(os.path.abspath(__file__), encoding='utf-8').read()
+    tree = ast.parse(own)
+    guarded = {'copy2', 'copytree', 'remove'}
+    leaks = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name == 'install':
+            continue
+        if node.name.startswith('_') and node.name != '_demo_initiative':
+            continue
+        if node.name in ('check', 'skip', 'run', 'main'):
+            continue
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call) or not call.args:
+                continue
+            fn = call.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, 'id', '')
+            if name not in guarded:
+                continue
+            if any(isinstance(n, ast.Name) and n.id == 'ROOT'
+                   for n in ast.walk(call.args[0])):
+                leaks.append(f'{node.name}:{call.lineno}')
+    check('selftest · no fixture copies the host\'s content',
+          not leaks, f'{len(leaks)} site(s): {leaks[:3]}')
+
+    run([B('bin', 'index')], brain)
+    run([B('bin', 'graph-build')], brain)
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Does a fresh install work, and do the tools survive foreign content?')
+    ap.add_argument('-v', '--verbose', action='store_true')
+    args = ap.parse_args()
+
+    tmp = tempfile.mkdtemp(prefix='brain-selftest-')
+    try:
+        print('Install')
+        brain = install(tmp, args.verbose)
+        # A layer that raises used to abort the run: 4 checks reported, ~50
+        # never reached, and the traceback read as a tooling failure rather
+        # than as the one broken fixture it was. A crash is a failure of that
+        # layer, not of the suite's ability to report.
+        for label, fn in (('Foreign content', fixture),
+                          ('Regressions — one per finding that changed code',
+                           regressions)):
+            print(f'\n{label}')
+            try:
+                fn(brain, args.verbose)
+            except Exception as e:
+                check(f'{label} — the layer itself ran to completion', False,
+                      f'{type(e).__name__}: {e}')
+                traceback.print_exc()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    tail = f'\n  {len(passed)} passed, {len(failed)} failed'
+    if skipped:
+        tail += f', {len(skipped)} skipped'
+    print(tail)
+    for name, reason in skipped:
+        print(f'    skipped: {name}\n             {reason}')
+    if failed:
+        for f in failed:
+            print(f'    failed: {f}')
+        return 1
+    print('  A green run locks in what three adoptions taught us. It is not')
+    print('  evidence the brain is ready for a project it has never met.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

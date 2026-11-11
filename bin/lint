@@ -1,0 +1,780 @@
+#!/usr/bin/env python3
+"""Validate the OKF conformance of every markdown file under brain/.
+
+Usage: brain/bin/lint [--quiet]
+Exit 1 on any error. Warnings never fail the run.
+
+No dependencies: the frontmatter parser handles the flat YAML the templates use.
+"""
+import os, re, sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+# `work` holds append-only journals: prose a worker writes as it goes, not
+# OKF concepts. They stay in the graph — a journal linking to a task is real
+# provenance — but they are not conformance-checked.
+# `skills` holds SKILL.md files, which carry Claude Code frontmatter (name,
+# description) rather than OKF. They are tooling, not knowledge.
+# `feedback` holds raw inbound — transcripts, reports — which is not in source
+# control and is not an OKF concept. The findings derived from it are, as
+# evidence nodes under reference/.
+# `handoff` holds the authored half of a handoff document — prose and images
+# composed into generated HTML by `bin/handoff`. Fragments of a page, not OKF
+# concepts, and not addressable on their own.
+# `templates` holds the files a new node is started *from*. They are patterns,
+# so they carry no id and nothing they `serves`; `graph-build` and `relevant`
+# already skip them and this makes the three agree.
+SKIP_DIRS = {'bin', '.git', 'node_modules', 'work', 'skills', 'templates',
+             'docs', 'hooks', 'example', 'handoff', 'feedback'}
+
+# Linter-enforced taxonomy, grouped by the four categories of D0002. A `type`
+# outside this set is an error, not a warning: consistency is the whole reason
+# the catalog is queryable.
+#
+# `context` and `initiative-pointer` were removed by D0002. `context` was so
+# coarse that `relevant` and `ancestry` both invented an `experiment` kind by
+# sniffing the path; `initiative-pointer` had zero instances and duplicated
+# what a plan's own description says.
+CATEGORY = {
+    'goal':      'Intent',    # an outcome, never an implementation
+    'principle': 'Intent',    # a decision with no alternatives and no expiry
+    'decision':  'Intent',    # a choice made, with alternatives and rationale
+    'plan':      'Approach',  # how a decision gets carried out, in what order
+    'spec':      'Approach',  # what will exist
+    'task':      'Action',    # one tracker ticket; the only executable node
+    'evidence':  'Evidence',  # what was observed, given, or learned in review
+}
+TYPES = set(CATEGORY) | {'glossary'}   # glossary is definitional, not a claim
+
+# The id letter per type. Principles share the decision sequence (D0003): the
+# P would otherwise collide with plan, and sharing states the relationship.
+LETTER = {'goal': 'G', 'principle': 'D', 'decision': 'D', 'plan': 'P',
+          'spec': 'S', 'task': 'T', 'evidence': 'E'}
+
+# Body headings a type must carry. A decision with no Alternatives section is
+# an assertion wearing a decision's clothes — but "no additional alternatives"
+# is a legitimate thing for the section to say, so the check is that the
+# heading exists and has prose under it, never that it lists rejected options.
+REQUIRED_HEADINGS = {
+    'decision':  ['# Context', '# Decision', '# Alternatives', '# Consequences'],
+    'principle': ['# Principle', '# Rationale', '# Implications'],
+    'goal':      ['# Goal', '# Why', '# Signals'],
+}
+
+# Navigation and prose files carry no `type`. The last three are the agent-skills
+# adaptation layer: configuration that tells the generic skills what "the issue
+# tracker" and "domain docs" mean here. Configuration is not a claim about the
+# work, so it is addressed by path and carries no id.
+RESERVED = {'index.md', 'log.md', 'howto.md', 'README.md', 'TODO.md', 'map.md',
+            'facts.md',
+            'tracker.md', 'domain.md', 'triage-labels.md', 'config.md',
+            'CLAUDE.md', 'AGENTS.md', 'INIT.md'}
+
+# Frontmatter a reserved file may carry. Configuration is addressed by its
+# path — the tools look up `config.md` by name — so giving it an id would mean
+# a filename the tools could not predict.
+RESERVED_KEYS = {'index.md': {'okf_version'},
+                 'config.md': {'mode', 'repos', 'tracker', 'docs', 'brain_revision',
+                               # Fields this install says people read and no
+                               # tool does, on purpose — see bin/unread.
+                               'human_fields', 'title',
+                               'description', 'timestamp', 'tags', 'status',
+                               'type', 'id'}}
+
+# A task's `status`, from issue-tracker.md. Enforced because `bin/status` reads
+# this field to decide what is claimable, and it compares against the exact
+# string `Ready for Development` — so a ticket written as `Ready` is not a
+# cosmetic difference, it is a ticket that silently never appears on the
+# frontier. Written twice before this check existed, both times by me.
+#
+# Two vocabularies, disjoint by type rather than split across two fields: a
+# second field would make every reader ask which one to look at.
+STATUSES = {
+    'Not Ready',             # needs triage or more information
+    'Ready for Development', # claimable: the frontier is built from exactly this
+    'In Progress',
+    'Testing',
+    'Complete',
+    'Delivered',
+    # Built, then removed. The decisions half of this brain has had
+    # `superseded` since the catalog was written — *"supersede, don't delete.
+    # When a decision changes, set `status: superseded`, link the
+    # replacement"* — and the tracker did not, so work that was done and then
+    # undone had no honest status. `Complete` claims it shipped and is still
+    # there; `Not Ready` claims it is waiting. Both are lies about 017.
+    'Superseded',
+}
+
+# A task's `category`. `question` is here because an unresolved question that
+# blocks work is a task (D0009) — it has an owner and an action, which is the
+# definition of work — and one that blocks nothing stays evidence. A value in
+# an existing enum rather than a type of its own.
+CATEGORIES = {'bug', 'enhancement', 'question'}
+
+# Everything that is not a task carries a document lifecycle instead. `amended`
+# exists because /spec-review recommends dated amendments and there was no
+# status for one, so an amended decision read as untouched.
+DOC_STATUSES = {'draft', 'active', 'amended', 'superseded', 'deprecated'}
+AMENDABLE = {'decision', 'principle'}
+
+# Frontmatter edges that legitimately point *forward* in time (D0002): a reader
+# who has reached a stale node must be carried to what replaced it.
+FORWARD_EDGES = {'superseded_by', 'amends'}
+
+# A node marked `append_only: true` is a running record — a project log, an
+# open-questions list, a state snapshot. Its `timestamp` is when it was
+# *opened*, so its content legitimately runs ahead of it, and a November entry
+# citing a November decision is correct rather than a violation.
+#
+# Found on the first real import: a project log opened in July and appended
+# through November produced one direction warning per decision it mentioned,
+# twenty of them, every one spurious. Re-dating the file to its last append
+# would have been worse — that invalidates every citation *of* it instead.
+#
+# A `task` is append-only by construction: the template gives every one a
+# `# Log`, its timestamp is when it was opened, and a task worked through
+# October legitimately cites an October decision. So the type carries the
+# exemption without needing the field.
+ALWAYS_APPEND_ONLY = {'task'}
+
+errors, warnings = [], []
+
+
+def check_graph_is_current(files, warnings):
+    """Warn when `brain/graph.html` is older than the files it was built from.
+
+    The graph is a **generated file that is committed**, so it drifts the moment
+    anyone edits a ticket without rebuilding — and it drifts silently, because a
+    stale graph looks exactly like a current one. Twenty-one tickets read as
+    `Testing` off a build that predated their completion by a day.
+
+    The page does print its build time, which turned out not to be enough: the
+    information was there and nobody had a reason to look at it. A warning here
+    arrives while someone is already asking whether the brain is in order, which
+    is when the answer is wanted.
+    """
+    graph = os.path.join(ROOT, 'graph.html')
+
+    if not os.path.exists(graph):
+        warnings.append('graph.html has never been built — run `brain/bin/graph-build`')
+        return
+
+    built = os.path.getmtime(graph)
+    newer = sorted(rel for rel, path in files.items() if os.path.getmtime(path) > built)
+
+    if newer:
+        shown = ', '.join(newer[:3]) + ('…' if len(newer) > 3 else '')
+        warnings.append(
+            f'graph.html is older than {len(newer)} file(s) it is built from '
+            f'({shown}) — run `brain/bin/graph-build`'
+        )
+
+
+def check_indexes(files):
+    """Folder indexes that disagree with the nodes beside them.
+
+    `bin/index` rebuilds them and `bin/new` calls it, so they stay current
+    through the normal path. Editing a node's frontmatter by hand does not,
+    and nothing said so: an adopter set a task's status directly and the
+    initiative's index went on showing the old one until an unrelated update
+    happened to regenerate it. Stale by exactly the mechanism D0001 warns
+    about — a confident note costing a reader what they would have found by
+    looking.
+
+    Compared by *content*, not mtime. An mtime version flagged four indexes
+    when one node had changed and would not clear after a rebuild, because a
+    generator that only rewrites what differs leaves the rest older than
+    everything around them. A check with false positives it cannot clear is
+    one people switch off.
+    """
+    for rel, path in sorted(files.items()):
+        if os.path.basename(rel) != 'index.md':
+            continue
+        folder = os.path.dirname(path)
+        try:
+            text = open(path, encoding='utf-8').read()
+        except OSError:
+            continue
+
+        present = {n for n in os.listdir(folder)
+                   if n.endswith('.md') and n != 'index.md'
+                   and re.match(r'^[GDPSTE]\d{4}-', n)}
+        if not present and '| id |' not in text:
+            continue
+
+        listed = {m.group(1) for m in re.finditer(r'\]\(([^)\s]+\.md)\)', text)}
+        missing = sorted(present - listed)
+        if missing:
+            warnings.append(
+                f'{rel} does not list {len(missing)} node(s) beside it '
+                f'({", ".join(missing[:2])}) — run `brain/bin/index`')
+            continue
+
+        # Statuses, which is what goes stale when frontmatter is hand-edited.
+        #
+        # Which column that is has to be read from the header, not assumed:
+        # the decisions index puts *type* second and status elsewhere, so a
+        # fixed column offset reported every principle as a wrong status. A
+        # check that cries wolf on a correct record is one nobody keeps.
+        header = re.search(r'^\|\s*id\s*\|(.+)\|\s*$', text, re.M | re.I)
+        if not header:
+            continue
+        cols = [c.strip().lower() for c in header.group(1).split('|')]
+        if 'status' not in cols:
+            continue
+        at = cols.index('status')
+
+        for name in sorted(present):
+            row = re.search(rf'^\|[^|\n]*\]\({re.escape(name)}\)[^|\n]*\|(.+)$',
+                            text, re.M)
+            if not row:
+                continue
+            cells = [c.strip() for c in row.group(1).split('|')]
+            if at >= len(cells):
+                continue
+            fm, _, _ = parse_front(open(os.path.join(folder, name),
+                                        encoding='utf-8').read())
+            actual = str(fm.get('status', '')).strip()
+            if actual and cells[at] != actual:
+                warnings.append(
+                    f'{rel} shows `{name}` as `{cells[at]}` but the node says '
+                    f'`{actual}` — run `brain/bin/index`')
+                break
+
+
+def parse_front(text):
+    """Return (frontmatter dict, raw frontmatter string or None, body)."""
+    m = re.match(r'^---\n(.*?)\n---\n?', text, re.S)
+    if not m:
+        return {}, None, text
+    fm, key = {}, None
+    for line in m.group(1).splitlines():
+        if re.match(r'^\s+-\s', line) and key:
+            fm.setdefault(key, [])
+            if isinstance(fm[key], list):
+                fm[key].append(line.strip()[2:].strip().strip('"\''))
+            continue
+        if ':' not in line or line.startswith(' '):
+            continue
+        k, v = line.split(':', 1)
+        key, v = k.strip(), v.strip()
+        if v.startswith('[') and v.endswith(']'):
+            v = [x.strip().strip('"\'') for x in v[1:-1].split(',') if x.strip()]
+        elif v == '':
+        # A key with no inline value opens a block sequence. Setting it to ''
+        # here made the `- item` lines below fall through `isinstance(..., list)`
+        # and vanish — so `constrains:` written the way most people write it
+        # governed nothing, past a green lint, silently switching off the
+        # payoff the README is built around.
+            v = []
+        fm[key] = v
+    return fm, m.group(1), text[m.end():]
+
+
+def check_yaml_hazards(rel, raw):
+    """A ` #` opens a YAML comment and an unquoted `: ` is a parse error.
+
+    Both silently truncate or break a value. This bit an earlier catalog once: a
+    description was cut off at a "#3310" reference and nobody noticed for a
+    round. Cheap to check, so check it.
+    """
+    for line in (raw or '').splitlines():
+        if ':' not in line or line.startswith(' '):
+            continue
+        k, v = line.split(':', 1)
+        v = v.strip()
+        if not v or v.startswith(('"', "'", '[')):
+            continue
+        if ' #' in v:
+            warnings.append(f'{rel}: `{k.strip()}` contains " #", which opens a YAML '
+                            f'comment and truncates the value — quote it')
+        if ': ' in v:
+            errors.append(f'{rel}: `{k.strip()}` contains ": " unquoted, which is a '
+                          f'YAML parse error — quote it')
+
+
+LINK_RE = re.compile(r'\[[^\]]*\]\(([^)\s]+)\)')
+
+# A backticked path naming a typed node — `D0014-x.md`, `../decisions/D0014-x.md`.
+# Deliberately narrow: it must carry an id, which is what separates a *citation*
+# from merely naming a file.
+NODE_REF = re.compile(r'`([^`\n]*?(?:^|/)[GDPSTE]\d{4}-[^`\n]*?\.md)`')
+
+
+def check_node_refs(rel, body, every_file):
+    """A citation of a node, written in backticks, is a lost edge.
+
+    Measured on the first real adoption: **122 of them**, every one a genuine
+    citation — a task naming the decision it carries out, a plan naming the
+    runbook it depends on. None appeared in the graph, none were followable by
+    a reader, and none would survive a rename.
+
+    The rule is not "all references must be links", which was tried against the
+    same corpus and produced roughly three hundred findings, most of them
+    noise: `config.md` and `CONTEXT.md` are file *names* in prose, not
+    citations. Requiring an id in the path is what separates the two, and it
+    cut 300 findings to 128 of which 127 were real.
+
+    `bin/relink` converts the resolvable ones.
+    """
+    fenced = False
+    for line in body.split('\n'):
+        if line.strip().startswith('```'):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        for m in NODE_REF.finditer(line):
+            target = m.group(1)
+            if '<' in target or '*' in target:
+                continue
+            cand = os.path.normpath(os.path.join(os.path.dirname(rel), target))
+            if cand in every_file or os.path.isfile(os.path.join(ROOT, cand)):
+                warnings.append(f'{rel}: `{target}` cites a node in backticks — make it '
+                                f'a link so it becomes an edge (`bin/relink` does this)')
+            else:
+                warnings.append(f'{rel}: `{target}` names a node that does not exist — '
+                                f'a citation in backticks rots silently, since nothing '
+                                f'checks it')
+
+
+def check_links(rel, body, every_file):
+    base = os.path.dirname(rel)
+    for m in LINK_RE.finditer(body):
+        target = m.group(1)
+        if target.startswith(('http://', 'https://', 'mailto:', '#')):
+            continue
+        if target.startswith('/'):
+            errors.append(f'{rel}: bundle-relative link `{target}` — GitHub resolves a '
+                          f'leading "/" from the repo root, so this 404s when browsing. '
+                          f'Use a relative path.')
+            continue
+        if not target.endswith('.md'):
+            continue
+        cand = os.path.normpath(os.path.join(base, target.split('#')[0]))
+        # Resolve against the disk, not only the walked set: `work/` and `skills/`
+        # are skipped for conformance but are real link targets.
+        if cand not in every_file and not os.path.isfile(os.path.join(ROOT, cand)):
+            warnings.append(f'{rel}: link to `{target}` does not resolve '
+                            f'(fine if it marks future work)')
+
+
+ID_RE = re.compile(r'^([GDPSTE])(\d{4})$')
+
+
+def check_id(rel, fm, name, seen):
+    """An id must exist, match its type's letter, agree with the filename, and
+    be unique across the brain.
+
+    **Uniqueness is the load-bearing one.** Two operators each adding `D0014`
+    with different slugs produce *different filenames*, so git merges them
+    cleanly and no conflict is ever raised. Nothing else in the system would
+    notice; this check is the only thing standing between that and two nodes
+    answering to one id.
+    """
+    kind = fm.get('type')
+    if kind not in LETTER:
+        return
+
+    ident = fm.get('id')
+    if not ident:
+        errors.append(f'{rel}: no `id` — every typed node carries one (e.g. '
+                      f'`{LETTER[kind]}0001`)')
+        return
+
+    m = ID_RE.match(str(ident))
+    if not m:
+        errors.append(f'{rel}: id `{ident}` is not a type letter plus four digits')
+        return
+
+    if m.group(1) != LETTER[kind]:
+        errors.append(f'{rel}: id `{ident}` starts with `{m.group(1)}` but type '
+                      f'`{kind}` uses `{LETTER[kind]}`')
+
+    if not name.startswith(f'{ident}-'):
+        errors.append(f'{rel}: filename does not start with its id `{ident}-` — '
+                      f'the two copies must agree or a rename orphans the node')
+
+    if ident in seen:
+        errors.append(f'{rel}: duplicate id `{ident}`, already used by '
+                      f'`{seen[ident]}` — resolve with `bin/renumber`')
+    else:
+        seen[ident] = rel
+
+
+def check_status(rel, fm):
+    """Two status vocabularies, disjoint by type (D0007)."""
+    kind, status = fm.get('type'), fm.get('status')
+    if not status or kind not in TYPES:
+        return
+
+    if kind == 'task':
+        if status not in STATUSES:
+            errors.append(f'{rel}: status `{status}` is not one of '
+                          f'{", ".join(sorted(STATUSES))}')
+    elif status not in DOC_STATUSES:
+        errors.append(f'{rel}: status `{status}` is not one of '
+                      f'{", ".join(sorted(DOC_STATUSES))} (task statuses are '
+                      f'for tasks only)')
+    elif status == 'amended' and kind not in AMENDABLE:
+        errors.append(f'{rel}: `amended` applies to a decision or principle, '
+                      f'not to a `{kind}`')
+
+
+def check_headings(rel, fm, body):
+    """A decision with no Alternatives section is an assertion in costume.
+
+    The check is that the heading is present and has prose beneath it. "No
+    additional alternatives" is a legitimate answer — a decision that genuinely
+    had no option is still a decision — and demanding a rejected option would
+    only teach people to invent one.
+    """
+    wanted = REQUIRED_HEADINGS.get(fm.get('type'))
+    if not wanted:
+        return
+
+    # Imported material is exempt until it is promoted. `/brain-init` lands
+    # everything it reconstructs as `draft`, and a brain adopted into a project
+    # already in flight arrives with decisions written in that project's own
+    # shape — twenty-one of them, in the first real adoption. Demanding this
+    # brain's body headings on day one forces a choice between mangling real
+    # reasoning and inventing sections to satisfy a linter, and the second is
+    # what D0001 exists to forbid. Promote a draft and the check applies.
+    if fm.get('status') == 'draft':
+        return
+
+    for heading in wanted:
+        m = re.search(rf'^{re.escape(heading)}\s*$', body, re.M)
+        if not m:
+            errors.append(f'{rel}: `{fm["type"]}` is missing the `{heading}` section')
+            continue
+        rest = body[m.end():]
+        nxt = re.search(r'^# ', rest, re.M)
+        if not (rest[:nxt.start()] if nxt else rest).strip():
+            # The hint has to suit the section. "No additional alternatives" is
+            # the right thing to say under `# Alternatives` and nonsense under
+            # a goal's `# Why`, where it appeared for anyone who left one empty.
+            hint = ('even if it is "no additional alternatives"'
+                    if heading == '# Alternatives'
+                    else 'an empty section claims there was nothing to say')
+            warnings.append(f'{rel}: `{heading}` is empty — {hint}')
+
+
+def scaffold_tokens():
+    """The placeholder tokens the shipped templates actually use.
+
+    Identity, not pattern — the lesson `.template-record` already taught at a
+    cost. `<[a-z][^<>]{3,}>` matches any angle-bracket token, and on a real
+    corpus that is mostly legitimate content: an email address written
+    `<someone@example.com>`, an HTML element named `<form>`, a quoted example
+    reading `'<student> (1 of 8)'`. Measured against a third adopter's brain
+    before shipping: five errors, five of them false, zero real scaffolds —
+    the ratio that gets a rule switched off along with everything it would
+    have caught.
+
+    So the check asks what the templates write, and flags only that.
+    """
+    folder = os.path.join(ROOT, 'knowledge-catalog', 'reference',
+                          'agent-skills', 'templates')
+    found = set()
+    if os.path.isdir(folder):
+        for name in os.listdir(folder):
+            if not name.endswith('.md'):
+                continue
+            try:
+                text = open(os.path.join(folder, name), encoding='utf-8').read()
+            except OSError:
+                continue
+            found |= set(re.findall(r'<[a-z][^<>\n]{2,}>', text))
+    # The floor, for a brain whose templates have been edited away: these are
+    # what `bin/new` substitutes, so a node still carrying one is unfilled.
+    found |= {'<YYYY-MM-DD>', '<one sentence>', '<title>', '<type>'}
+    return found
+
+
+SCAFFOLDS = scaffold_tokens()
+PLACEHOLDER = re.compile(
+    '|'.join(re.escape(t) for t in sorted(SCAFFOLDS, key=len, reverse=True))
+) if SCAFFOLDS else re.compile(r'(?!)')
+
+
+def check_placeholders(rel, fm, body):
+    """A scaffold that was never filled in is an uncheckable claim wearing a
+    node's frontmatter — D0001's exact target, waved through by the gate.
+
+    `bin/new` writes `description: <one sentence>`; a node reaching the record
+    still carrying it says nothing and looks like it says something. Found by
+    the first greenfield adopter, who noticed their own placeholder passing
+    clean.
+    """
+    # Every frontmatter field, not two of them. It inspected `title` and
+    # `description` only, because those are what `bin/new` scaffolds most
+    # visibly — so two live tasks sat in a real record carrying
+    # `spec: <optional relative link to the spec>`, and the gate waved them
+    # through. `check_edges` missed them too, filtering to values ending
+    # `.md`. Two checks, each declining to look where the other did not.
+    #
+    # An adopter found them by predicting lint errors that were absent, then
+    # asking why. The absence was the finding.
+    for field in sorted(fm):
+        # `timestamp` is stamped at install by `bin/adopt` and per node by
+        # `bin/new`, so the unadopted template carries the placeholder by
+        # design — `bin/doctor` warns about it, which is the right severity
+        # for a thing the next command fixes. Erroring here would make the
+        # template fail its own gate.
+        if field == 'timestamp':
+            continue
+        v = fm.get(field)
+        if isinstance(v, list):
+            v = ' '.join(str(x) for x in v)
+        v = str(v or '')
+        m = PLACEHOLDER.search(v)
+        if m:
+            # Name the token found. It used to print the whole field and claim
+            # it was "still the scaffold text", which misattributed a real
+            # sentence that merely contained an angle-bracket token.
+            errors.append(f'{rel}: `{field}:` still carries the scaffold token '
+                          f'`{m.group(0)}` — fill it in, or delete the line if '
+                          f'the field does not apply')
+
+    # Angle brackets in backticks or a fence are documented command syntax —
+    # `bin/new <type>`, `<project>/brain`, `--owner <name>`. The first version
+    # of this check flagged ten of them and zero real scaffolds, which is the
+    # ratio that gets a rule switched off along with everything it would have
+    # caught.
+    fenced = False
+    for n, line in enumerate(body.split('\n'), 1):
+        if line.strip().startswith('```'):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        bare = re.sub(r'`[^`]*`', '', line)
+        m = PLACEHOLDER.search(bare)
+        if m:
+            errors.append(f'{rel}:{n}: unfilled placeholder `{m.group(0)[:44]}` — '
+                          f'a scaffold that reached the record says nothing while '
+                          f'looking like it says something')
+            break
+
+
+def check_serves(rel, fm):
+    """An Approach node names the goal it serves, so a reverse walk terminates.
+
+    Measured before this existed: deleting two prose links from a spec dropped
+    `bin/ancestry`'s closure to zero decisions and zero goals, silently. A
+    typed edge is enumerable; a body link is a hope.
+    """
+    if CATEGORY.get(fm.get('type')) == 'Approach' and not fm.get('serves'):
+        warnings.append(f'{rel}: no `serves` — a {fm["type"]} names the goal it '
+                        f'serves, or a lineage walk cannot terminate in Intent')
+
+
+# Typed frontmatter edges, and what each may point at. `constrains` is absent
+# because it holds path globs, not citations, and `blocked_by` because it is
+# scheduling — but both are *known*, which is what stops them being reported as
+# unrecognised.
+EDGE_TARGETS = {
+    # A decision is Intent too, and for a project whose intent arrives from
+    # outside as prose it is the only form it takes. Restricting `serves:` to
+    # a goal forced a consulting brain with 23 decisions and no plans to
+    # either invent plans or live with every task UNTERMINATED.
+    'serves': {'goal', 'decision', 'principle'},
+    'spec': {'spec'},
+    'reviewed': {'evidence'},
+    'superseded_by': None,   # any type: a node is replaced by its own kind
+    'amends': None,
+    'blocked_by': None,
+    # A pointer to raw evidence kept outside the graph — a transcript, a
+    # report. Type-unconstrained because the thing it names is not a node.
+    'resource': None,
+}
+# `constrains` is excluded from resolution entirely, not merely from type
+# checking: it holds path *globs* matched against arbitrary paths by
+# bin/constraints, resolved from the brain root rather than the node's own
+# directory. Treating them as citations reported three real decisions as
+# broken — the check's first false positives, inside the gate.
+NOT_PATHS = {'constrains'}
+KNOWN_EDGE_KEYS = set(EDGE_TARGETS) | NOT_PATHS
+
+
+def check_edges(rel, fm, every_file):
+    """Frontmatter edges resolve, and point at the right kind of node.
+
+    Nothing checked these. `check_node_refs` validates *body* links, and
+    frontmatter paths were resolved only to feed the direction rule — so a
+    plan carrying `intent: ./intent.md`, pointing at a file its own migration
+    had deleted, passed with zero errors, and a deliberately bogus `spec:`
+    edge drew no warning either.
+
+    That is the wrong way round. The README's own argument for typed edges is
+    that **"a typed edge is enumerable; a body link is a hope"** — and the
+    linter was checking the hope. An unresolvable body link is a warning
+    because it may be marking future work; an unresolvable typed edge is an
+    error, because a tool will traverse it.
+    """
+    for key, value in sorted(fm.items()):
+        if key in NOT_PATHS:
+            continue
+        values = [value] if isinstance(value, str) else (
+            list(value) if isinstance(value, list) else [])
+        paths = [v for v in values if isinstance(v, str)
+                 and v.strip().endswith('.md')
+                 and not v.startswith(('http', 'mailto:', '#'))]
+        if not paths:
+            continue
+        if key not in KNOWN_EDGE_KEYS:
+            warnings.append(
+                f'{rel}: `{key}:` names a node but no tool traverses it — '
+                f'either it is a typed edge the toolchain should know '
+                f'({", ".join(sorted(EDGE_TARGETS))}), or it belongs in the body')
+        for target in paths:
+            resolved = os.path.normpath(
+                os.path.join(os.path.dirname(rel), target.split('#')[0]))
+            # feedback/ and work/ are skipped by the walk but are real
+            # directories on disk, so a pointer into them resolves.
+            if (resolved not in every_file
+                    and not os.path.isfile(os.path.join(ROOT, resolved))):
+                errors.append(
+                    f'{rel}: `{key}: {target}` does not resolve. A typed edge is '
+                    f'traversed by tools, so unlike a body link it cannot stand '
+                    f'as a note about future work')
+                continue
+            want = EDGE_TARGETS.get(key)
+            if not want:
+                continue
+            try:
+                other, _, _ = parse_front(
+                    open(every_file[resolved], encoding='utf-8').read())
+            except (OSError, KeyError, ValueError):
+                continue
+            got = other.get('type')
+            if got and got not in want:
+                errors.append(
+                    f'{rel}: `{key}:` points at a `{got}`, and {key} names a '
+                    f'{" or ".join(sorted(want))}')
+
+
+def check_direction(nodes):
+    """Nothing cites a node newer than itself (D0002).
+
+    Timestamps here are hand-written dates, so this catches a March node cited
+    by a November one and never a same-day violation. That is the intended
+    reach: it is a guard against rewriting history, not a clock.
+    """
+    for rel, (when, links, append_only) in nodes.items():
+        if not when or append_only:
+            continue
+        for target in links:
+            other = nodes.get(target)
+            if other and other[0] and other[0] > when:
+                warnings.append(f'{rel} ({when}) links to `{target}` ({other[0]}), '
+                                f'which is newer — a node may not cite one written '
+                                f'after it (D0002). Cite what it established instead.')
+
+
+def main():
+    quiet = '--quiet' in sys.argv
+    files = {}
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for f in filenames:
+            if f.endswith('.md'):
+                p = os.path.join(dirpath, f)
+                files[os.path.relpath(p, ROOT)] = p
+
+    seen_ids, nodes, statuses = {}, {}, {}
+
+    for rel, path in sorted(files.items()):
+        name = os.path.basename(rel)
+        text = open(path, encoding='utf-8').read()
+        fm, raw, body = parse_front(text)
+
+        if name in RESERVED:
+            allowed = RESERVED_KEYS.get(name, set())
+            extra = set(fm) - allowed
+            if raw is not None and extra:
+                warnings.append(f'{rel}: reserved file carries frontmatter '
+                                f'({", ".join(sorted(extra))})')
+        else:
+            if raw is None:
+                errors.append(f'{rel}: no frontmatter — every non-reserved file needs '
+                              f'a `type`')
+            elif 'type' not in fm:
+                errors.append(f'{rel}: frontmatter has no `type`')
+            elif fm['type'] not in TYPES:
+                errors.append(f'{rel}: type `{fm["type"]}` is not one of '
+                              f'{", ".join(sorted(TYPES))}')
+            for field in ('title', 'description'):
+                if raw is not None and field not in fm:
+                    warnings.append(f'{rel}: no `{field}` (used to build index entries)')
+
+            # A status outside its type's set does not fail loudly — it makes the
+            # node invisible to the tool meant to surface it. Hence an error.
+            check_status(rel, fm)
+            if fm.get('status'):
+                statuses[rel] = fm['status']
+            if fm.get('type') == 'task' and fm.get('category') \
+               and fm['category'] not in CATEGORIES:
+                errors.append(f'{rel}: category `{fm["category"]}` is not one of '
+                              f'{", ".join(sorted(CATEGORIES))}')
+            check_id(rel, fm, name, seen_ids)
+            check_headings(rel, fm, body)
+            check_serves(rel, fm)
+            check_edges(rel, fm, files)
+            check_placeholders(rel, fm, body)
+
+            # Collect the backward-pointing edges for the direction rule. The
+            # forward ones are the sanctioned exceptions and are skipped.
+            if fm.get('type') in CATEGORY:
+                targets = []
+                # `blocked_by` is deliberately absent: it is scheduling, not
+                # a citation. A September task discovering in November that
+                # something blocks it is not rewriting history, it is learning
+                # — and the rule exists to stop a node claiming a justification
+                # that did not exist when it was written. Same distinction
+                # bin/ancestry already makes; missed here until a real import
+                # wired two blockers and the linter objected to both.
+                for k in ('serves', 'spec', 'reviewed'):
+                    v = fm.get(k) or []
+                    targets += [v] if isinstance(v, str) else list(v)
+                targets += [m.group(1) for m in LINK_RE.finditer(body)]
+                resolved = set()
+                for t in targets:
+                    if t.startswith(('http', 'mailto:', '#', '/')) or not t.endswith('.md'):
+                        continue
+                    resolved.add(os.path.normpath(
+                        os.path.join(os.path.dirname(rel), t.split('#')[0])))
+                nodes[rel] = (str(fm.get('timestamp') or ''), resolved,
+                              str(fm.get('append_only', '')).lower() == 'true'
+                              or fm.get('type') in ALWAYS_APPEND_ONLY)
+
+        check_yaml_hazards(rel, raw)
+        check_links(rel, body, files)
+        check_node_refs(rel, body, files)
+
+
+    # /brain-init promised that lint reports this, and nothing ever did. An
+    # import lands everything as `draft` precisely so the amount still
+    # unreviewed is visible; a count nobody prints is not visible.
+    drafts = [rel for rel, fm in statuses.items() if fm == 'draft']
+    if drafts:
+        shown = ', '.join(sorted(drafts)[:3]) + ('…' if len(drafts) > 3 else '')
+        warnings.append(f'{len(drafts)} node(s) still `draft` — imported or scaffolded '
+                        f'and not yet vouched for ({shown})')
+
+    check_direction(nodes)
+    check_graph_is_current(files, warnings)
+    check_indexes(files)
+
+    for w in warnings:
+        if not quiet:
+            print(f'warn  {w}')
+    for e in errors:
+        print(f'ERROR {e}', file=sys.stderr)
+
+    print(f'\n{len(files)} files · {len(errors)} errors · {len(warnings)} warnings')
+    return 1 if errors else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

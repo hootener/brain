@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""What the operator actually said, out of Claude Code's own transcripts.
+
+Usage:
+    brain/bin/utterances                    # this project, newest session first
+    brain/bin/utterances --repeated         # things said more than once
+    brain/bin/utterances --since 2026-11-01
+    brain/bin/utterances --json
+
+## Why this is a tool and not an instruction
+
+`/brain-init` tells an agent to mine the transcript history for decisions
+nobody wrote down. The obvious way to do that — walk the `.jsonl`, keep
+entries whose `message.role` is `user` — **silently drops the operator's
+answers to direct questions.**
+
+An answer to `AskUserQuestion` is stored as a `tool_result` block inside a
+user-role envelope, not as message text. Verified on a real session: the
+operator's *"honestly brain as the subdir is probably the least destructive
+here"* lives in `content[0].content`, keyed by `tool_use_id`, with the free
+text they typed after `notes:`.
+
+What a naive miner finds in its place is the **assistant's paraphrase** of
+that answer, in assistant message text. Quote that, cite the transcript as
+`resource:`, and you have manufactured an operator decision out of the
+previous agent's prose, with provenance that looks sound. That is laundering,
+and it is the precise failure `D0001` exists to forbid — a confident claim
+nobody can check, except the check appears to have been done.
+
+So the extraction is done once, here, and the judgement is left to the skill.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+PROJECTS = os.path.expanduser('~/.claude/projects')
+
+
+def slug_for(path):
+    """Claude Code names a project directory after its path, with separators
+    turned into hyphens."""
+    return re.sub(r'[^A-Za-z0-9]', '-', os.path.abspath(path))
+
+
+def candidate_dirs(explicit):
+    """The brain's own directory and its parent — embedded or sibling, the
+    operator works from one of the two."""
+    if explicit:
+        return [os.path.join(PROJECTS, slug_for(explicit))]
+    here = [ROOT, os.path.dirname(ROOT)]
+    return [os.path.join(PROJECTS, slug_for(p)) for p in here]
+
+
+def answers_from(block):
+    """Pull the operator's words out of an AskUserQuestion result.
+
+    The shape is prose: `The user answered: "<question>"=<choice> notes: <free
+    text>, "<question>"=<choice>`. The free text after `notes:` is the part
+    they typed themselves and the part worth having.
+    """
+    text = block if isinstance(block, str) else json.dumps(block)
+    out = []
+    for m in re.finditer(r'notes:\s*(.+?)(?=,\s*"|$)', text, re.S):
+        said = ' '.join(m.group(1).split()).strip().rstrip(',')
+        if len(said) > 12:
+            out.append(said)
+    for m in re.finditer(r'"[^"]+"=([^,"]{4,120})', text):
+        choice = m.group(1).strip()
+        if choice and not choice.startswith('(no option'):
+            out.append(f'[chose] {choice}')
+    return out
+
+
+def read_session(path):
+    """Yield (kind, text) for everything the operator themselves produced."""
+    asked = set()
+    for n, line in enumerate(open(path, encoding='utf-8', errors='replace'), 1):
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        msg = rec.get('message') or {}
+        if msg.get('role') != 'user':
+            # Only to learn which tool_use ids were questions.
+            for b in (msg.get('content') or []) if isinstance(msg.get('content'), list) else []:
+                if isinstance(b, dict) and b.get('type') == 'tool_use' \
+                   and b.get('name') == 'AskUserQuestion':
+                    asked.add(b.get('id'))
+            continue
+
+        content = msg.get('content')
+        if isinstance(content, str):
+            if content.strip() and not is_injected(content):
+                yield ('typed', content.strip(), n)
+            continue
+
+        for b in content or []:
+            if not isinstance(b, dict):
+                continue
+            if b.get('type') == 'text' and b.get('text', '').strip():
+                if not is_injected(b['text']):
+                    yield ('typed', b['text'].strip(), n)
+            elif b.get('type') == 'tool_result' and b.get('tool_use_id') in asked:
+                for said in answers_from(b.get('content')):
+                    yield ('answered', said, n)
+
+
+# A user-role envelope is not proof a person typed it. Skill bodies, slash
+# command expansions and system reminders all arrive this way, and one of them
+# was duly attributed to the operator — the same laundering this tool exists
+# to stop, one layer along.
+INJECTED = re.compile(
+    r'(<(system-reminder|command-name|command-message|command-args|'
+    r'local-command|user-prompt|EXTREMELY_IMPORTANT)\b'
+    r'|Base directory for this skill'
+    r'|^\s*---\s*\nname:\s'
+    r'|\[Request interrupted'
+    r'|Caveat: The messages below)', re.I | re.M)
+
+
+def is_injected(text):
+    """A user-role envelope is not proof a person typed it.
+
+    The first version anchored at the start and looked for `<system-reminder`
+    or leading frontmatter — the shape a report happened to quote. Claude Code
+    emits `Base directory for this skill: <path>` and *then* the body, so
+    neither fired, and 5,209 characters of a skill were published under
+    "These are the operator's words". Matching anywhere, on the marker the
+    harness actually emits, is the fix.
+    """
+    if INJECTED.search(text[:600]):
+        return True
+    head = text[:500]
+    if 'description:' in head and '---' in head[:20]:
+        return True
+    # A skill body by shape: frontmatter-ish keys plus markdown headings, long.
+    if len(text) > 1500 and head.count('\n## ') + head.count('\n# ') >= 2 \
+            and ('allowed-tools:' in head or 'disable-model-invocation' in head):
+        return True
+
+    return is_machine_payload(text)
+
+
+# Machine payloads that arrive in a user-role envelope. A teammate agent's
+# idle notification is JSON, and `--repeated` ranked one of them as the
+# operator's single most-repeated statement -- seven times, labelled
+# `[typed]`, which is the cleanest possible provenance for something no
+# person said.
+#
+# INIT.md tells a migrator to mine these rankings for the operator's own
+# words. Following it would have filed another agent's JSON as a founder's
+# decision, with the tool INIT recommends supplying the laundering INIT
+# forbids. Fourth adopter, third distinct instance of this class, and the
+# first to arrive through the tool rather than around it.
+MACHINE = re.compile(
+    r'^\s*[\[{]'
+    r'|"(event|type|status|agent|session|notification|idle|tool_use_id)"\s*:'
+    r'|^\s*(?:\w+-)?agent\b.*\bidle\b', re.I | re.M)
+
+
+def is_machine_payload(text):
+    """Does this read as a machine talking rather than a person typing?
+
+    Deliberately narrow. A false positive drops one real sentence from a
+    ranking; a false negative publishes another agent's output as the
+    operator's words with clean provenance, which is the one failure this
+    whole tool exists to prevent.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped[0] in '[{' and stripped[-1] in ']}':
+        try:
+            json.loads(stripped)
+            return True
+        except ValueError:
+            pass
+    return bool(MACHINE.search(stripped[:400]))
+
+
+def content_words(text):
+    stop = {'the','and','for','with','that','this','from','into','our','you',
+            'what','when','should','would','have','just','like','want','need'}
+    return {w for w in re.findall(r"[a-z][a-z'-]{3,}", text.lower()) if w not in stop}
+
+
+def normalise(text):
+    return re.sub(r'[^a-z0-9 ]', '', text.lower())[:110]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="What the operator said, from the transcripts.")
+    ap.add_argument('--project', help='path whose sessions to read (default: this brain and its parent)')
+    ap.add_argument('--since', help='YYYY-MM-DD')
+    ap.add_argument('--repeated', action='store_true',
+                    help='only what was said more than once — the strongest signal')
+    ap.add_argument('--limit', type=int, default=40)
+    ap.add_argument('--json', action='store_true')
+    args = ap.parse_args()
+
+    files = []
+    for d in candidate_dirs(args.project):
+        if os.path.isdir(d):
+            files += [os.path.join(d, f) for f in os.listdir(d) if f.endswith('.jsonl')]
+    files.sort(key=os.path.getmtime, reverse=True)
+
+    if not files:
+        print('No Claude Code transcripts for this project.')
+        print('That is an answer: there is no history to mine, and inventing one')
+        print('from the current conversation is not the same thing.')
+        return 0
+
+    found, seen = [], defaultdict(list)
+    # One utterance per (session, text). A transcript replays earlier context,
+    # so the same message appears many times in one file and every count was
+    # multiplied by however often the conversation had been re-sent. Measured
+    # on this project's own transcript: a sentence typed once reported five
+    # times, and the top three "most repeated" statements had each been said
+    # exactly once.
+    #
+    # Deduped by session rather than globally, because the thing --repeated
+    # exists to find is a standing instruction restated across *sessions* —
+    # people restate an instruction, they do not retype it. Collapsing within
+    # a session keeps that signal and removes the replay.
+    spoken = set()
+    for path in files:
+        if args.since and os.path.getmtime(path) < \
+           __import__('datetime').datetime.fromisoformat(args.since).timestamp():
+            continue
+        session = os.path.basename(path)[:8]
+        for kind, text, line in read_session(path):
+            key = (session, normalise(text))
+            if key in spoken:
+                continue
+            spoken.add(key)
+            found.append({'kind': kind, 'text': text,
+                          'session': session, 'line': line})
+            seen[normalise(text)].append(len(found) - 1)
+
+    if args.repeated:
+        # Matching exact strings returned nothing on a project where the same
+        # standing instruction had been given in three sessions. People restate
+        # an instruction; they do not retype it. Overlap of content words finds
+        # what string equality cannot.
+        words = [(i, content_words(e['text'])) for i, e in enumerate(found)]
+        groups, claimed = [], set()
+        for i, wi in words:
+            if i in claimed or len(wi) < 4:
+                continue
+            group = [i]
+            for j, wj in words:
+                if j <= i or j in claimed or len(wj) < 4:
+                    continue
+                # Jaccard, not containment. The old measure divided by the
+                # *smaller* set, so a short message whose words all appear in
+                # a long one scored 1.0 and was counted as a repetition of it.
+                # That is how three statements said exactly once each were
+                # reported as the operator's most-repeated, and the inflation
+                # grew with the length of the longest message in the project.
+                overlap = len(wi & wj) / max(1, len(wi | wj))
+                if overlap >= 0.55:
+                    group.append(j)
+                    claimed.add(j)
+            if len(group) > 1:
+                claimed.add(i)
+                groups.append(group)
+        found = [found[g[0]] | {'times': len(g)} for g in groups]
+        found.sort(key=lambda e: -e['times'])
+
+    if args.json:
+        print(json.dumps(found[:args.limit], indent=2))
+        return 0
+
+    print(f'{len(found)} operator utterance(s) across {len(files)} session(s)')
+    print('  "answered" came from a tool_result, which a naive miner drops entirely.')
+    print()
+    for e in found[:args.limit]:
+        tag = f"×{e['times']} " if e.get('times') else ''
+        text = ' '.join(e['text'].split())
+        shown = text[:420]
+        if len(text) > 420:
+            shown = shown.rsplit(' ', 1)[0] + f'  … ({len(text)} chars — `--json` for all)'
+        print(f"  [{e['kind']}] {tag}{e['session']}:{e['line']}")
+        print(f"      {shown}")
+        print()
+
+    print('  These are the operator\'s words. An assistant\'s summary of them is')
+    print('  not, and citing one as if it were is how a paraphrase acquires a')
+    print('  `resource:` it does not deserve.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

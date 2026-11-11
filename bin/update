@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""Bring the generic half of this brain up to date from a fresh copy.
+
+Usage:
+    brain/bin/update ~/src/brain-template       # a clone you already have
+    brain/bin/update --from https://github.com/hootener/brain.git
+    brain/bin/update --dry-run <source>
+    brain/bin/update --list                     # what counts as generic
+
+    # From a template checkout, when your install has no bin/update yet:
+    /tmp/brain-template/bin/update --target ~/project/brain
+
+Exit 1 if the source is missing or does not look like a brain.
+
+## Running it from a brain that does not have it
+
+The tool ships inside the half it updates, so the installs that most need it
+are the ones without it. Running the template's copy without `--target`
+updates **the template** — `ROOT` resolves from `__file__` — and prints a
+screenful of cheerful "updated" lines while changing nothing you own. Failure
+in the direction that looks like success.
+
+`--target` names the brain to update, so the template's copy can do the job
+with no bootstrap step to remember.
+
+## Why this is a tool
+
+It was a shell recipe in the README, and it was wrong in three ways at once:
+it pulled a clone in `/tmp`, which is the one directory guaranteed not to
+survive until an update; it looped over **directories**, so `INIT.md` — a
+top-level file — never arrived; and because `rm -rf skills` had already taken
+the old `skills/brain-init/` away, an updated install ended with neither the
+skill nor the document, while the very next instruction was to follow
+`brain/INIT.md`.
+
+The commit that introduced that hole edited the README in five other places
+and left the recipe byte-identical, because nothing runs a recipe. `bin/update`
+exists so `bin/selftest` can.
+
+## What is generic
+
+The half upstream owns. Everything else — your goals, decisions, specs,
+reference, tasks, plans, journals, brief, `config.md`, `graph.html`, and
+`example/` once you have one — is yours and is never touched.
+"""
+import argparse
+import filecmp
+import hashlib
+import re
+import os
+import shutil
+from datetime import date
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+# The single definition of "generic". `bin/selftest` asserts that a fresh
+# install contains nothing generic this list has missed, so a new top-level
+# file cannot quietly fall out of the update the way INIT.md did.
+GENERIC_DIRS = ['bin', 'skills', 'hooks', 'docs', '.github',
+                'knowledge-catalog/reference/agent-skills/templates']
+GENERIC_FILES = ['INIT.md', 'README.md', 'CLAUDE.md', '.gitignore',
+                 # The identity data the citation rewrite needs. Without it an
+                 # updated brain was safe only by the absence of the file.
+                 '.template-record',
+                 'knowledge-catalog/howto.md',
+                 'knowledge-catalog/reference/agent-skills/index.md',
+                 'knowledge-catalog/reference/agent-skills/tracker.md',
+                 'knowledge-catalog/reference/agent-skills/domain.md',
+                 'knowledge-catalog/reference/agent-skills/triage-labels.md',
+                 'brief/README.md', 'work/README.md', 'tasks/TODO.md',
+                 'feedback/README.md']
+
+# Yours. Named so the intent is readable, and so a reader can check the claim.
+# config.md is deliberately absent here: it is partly generic, and
+# listing it as untouched read as a false claim to an adopter who
+# diffed it. `--list` names it on its own line instead.
+NEVER_TOUCHED = ['facts.md', 'knowledge-catalog/goals', 'knowledge-catalog/decisions',
+                 'knowledge-catalog/specs', 'knowledge-catalog/reference/E*.md',
+                 'knowledge-catalog/glossary.md', 'knowledge-catalog/log.md',
+                 'tasks/<initiative>', 'plans', 'work', 'brief', 'example',
+                 'feedback', 'graph.html']
+
+
+def fetch(url):
+    tmp = tempfile.mkdtemp(prefix='brain-update-')
+    dest = os.path.join(tmp, 'template')
+    r = subprocess.run(['git', 'clone', '--depth', '1', '-q', url, dest],
+                       capture_output=True, text=True)
+    if r.returncode:
+        print(f'clone failed: {r.stderr.strip()}', file=sys.stderr)
+        sys.exit(1)
+    return dest
+
+
+def dir_diff(a, b):
+    """How many files differ between two directories, recursively."""
+    if not os.path.isdir(b):
+        return sum(len(fs) for _, _, fs in os.walk(a))
+    n = 0
+    for base, dirs, files in os.walk(a):
+        for f in files:
+            rel = os.path.relpath(os.path.join(base, f), a)
+            if differs(os.path.join(a, rel), os.path.join(b, rel)):
+                n += 1
+    for base, dirs, files in os.walk(b):
+        for f in files:
+            rel = os.path.relpath(os.path.join(base, f), b)
+            if not os.path.exists(os.path.join(a, rel)):
+                n += 1
+    return n
+
+
+def differs(a, b):
+    if os.path.isfile(a) and os.path.isfile(b):
+        return not filecmp.cmp(a, b, shallow=False)
+    return True
+
+
+MANIFEST = '.upstream-manifest'
+
+
+def sha(path):
+    try:
+        with open(path, 'rb') as fh:
+            return hashlib.sha1(fh.read()).hexdigest()
+    except OSError:
+        return ''
+
+
+def snapshot(root):
+    """Content hash of every file under the brain.
+
+    The report used to list what the copy loop *intended*. Three transforms
+    run after it and write files none of them mention — the template
+    re-stamp, the citation repoint (a subprocess whose output is captured and
+    discarded), and the config merge — so the report was wrong in both
+    directions: it undercounted by every file a transform touched, and
+    overcounted whenever a copy was decided and then made no difference.
+
+    Three fixes to the reporting layer did not hold, because the report was
+    never a measurement. Now it is one: hash before, hash after, print the
+    difference. It cannot drift from the truth, because it is derived from it.
+
+    This also closes a blind spot an adopter found in `bin/prove`: prove tests
+    from current state, so a false claim made by the updating run is invisible
+    to it unless you snapshotted beforehand. The tool now does that itself.
+    """
+    out = {}
+    skip = {'.git', '__pycache__'}
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for f in files:
+            fp = os.path.join(base, f)
+            out[os.path.relpath(fp, root)] = sha(fp)
+    return out
+
+
+def walk_rel(root):
+    """Every file under root, as paths relative to it."""
+    out = []
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in {'.git', '__pycache__'}]
+        for f in files:
+            out.append(os.path.relpath(os.path.join(base, f), root))
+    return sorted(out)
+
+
+def load_manifest():
+    """What upstream's generic files hashed to when this brain last updated."""
+    path = os.path.join(ROOT, MANIFEST)
+    out = {}
+    if not os.path.isfile(path):
+        return out
+    for line in open(path, encoding='utf-8'):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        digest, _, rel = line.partition('  ')
+        if rel:
+            out[rel] = digest
+    return out
+
+
+def save_manifest(shipped):
+    path = os.path.join(ROOT, MANIFEST)
+    lines = [f'{shipped[rel]}  {rel}' for rel in sorted(shipped)]
+    if os.path.isfile(path):
+        was = [l.strip() for l in open(path, encoding='utf-8')
+               if l.strip() and not l.startswith('#')]
+        if was == lines:
+            return
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write('# sha1 of each generic file as upstream shipped it, at the\n')
+        fh.write('# last update. Compared against upstream on the next run so\n')
+        fh.write('# that local transforms — the citation repoint, the template\n')
+        fh.write('# re-stamp — do not read as upstream changes forever.\n')
+        for rel in sorted(shipped):
+            fh.write(f'{shipped[rel]}  {rel}\n')
+
+
+def upstream_changed(rel, shipped_sha, recorded, src_path, dst_path):
+    """Has upstream changed this file since this brain last took it?
+
+    Comparing the local file to upstream was byte-accurate and useless: three
+    post-copy transforms — the citation repoint, the template re-stamp, and
+    config.md's merged values — guarantee the two differ, permanently. So
+    `differs()` was always true for six paths and the count could never reach
+    zero. It reported "6 path(s) updated (7 file(s))" over a run that changed
+    nothing, and `(7 file(s))` reads like a measurement, which made it harder
+    to doubt than the vaguer claim it replaced.
+
+    The question is about *upstream's* bytes, so that is what is recorded and
+    compared. A missing local file is always restored; with no manifest this
+    falls back to the old comparison, which is right for a first run.
+    """
+    if not os.path.exists(dst_path):
+        return True
+    if rel not in recorded:
+        return differs(src_path, dst_path)
+    return shipped_sha != recorded[rel]
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Update the generic half of this brain.')
+    ap.add_argument('source', nargs='?', help='a checkout of the template')
+    ap.add_argument('--from', dest='url', help='clone this URL instead')
+    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--list', action='store_true')
+    ap.add_argument('--target', help='the brain to update (default: the one this script is in)')
+    args = ap.parse_args()
+
+    global ROOT
+    if args.target:
+        ROOT = os.path.abspath(args.target)
+        if not os.path.isfile(os.path.join(ROOT, 'config.md')):
+            print(f'{ROOT} does not look like an installed brain (no config.md).',
+                  file=sys.stderr)
+            return 1
+
+    if args.list:
+        print('generic — replaced by an update:')
+        for d in GENERIC_DIRS:
+            print(f'  {d}/')
+        for f in GENERIC_FILES:
+            print(f'  {f}')
+        print('\nyours — never touched:')
+        for n in NEVER_TOUCHED:
+            print(f'  {n}')
+        print('\nboth — upstream\'s prose, your values:')
+        print('  config.md  (body replaced; mode, repos and brain_revision kept)')
+        return 0
+
+    # With --target the source is this script's own brain: that is the whole
+    # point of running the template's copy against an install that has no
+    # bin/update of its own.
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = (os.environ.get('BRAIN_UPDATE_SRC')
+           or (fetch(args.url) if args.url
+               else (args.source or (here if args.target else None))))
+    if not src:
+        print('Give a source: a path to a template checkout, or --from <url>.',
+              file=sys.stderr)
+        return 1
+    if not os.path.isfile(os.path.join(src, 'bin', 'lint')):
+        print(f'{src} does not look like a brain (no bin/lint).', file=sys.stderr)
+        return 1
+    if os.path.realpath(ROOT) == os.path.realpath(src):
+        # Running the template's own copy with no --target updated the
+        # template and announced thirteen successes.
+        print('Source and target are the same brain. Name the one you mean '
+              'with --target.', file=sys.stderr)
+        return 1
+
+    # Hand the rest of the run to the *new* bin/update before copying anything.
+    #
+    # This tool replaces its own file and then keeps executing the code Python
+    # already loaded, so every fix to `bin/update`'s own behaviour was
+    # unobservable in the release that shipped it and only true from the next
+    # one. Two such fixes shipped looking broken — honest per-path reporting
+    # and the template re-stamp — and both were correct on disk the whole
+    # time. the product team measured it by running the same command twice.
+    #
+    # It is invisible upstream because the template is never the thing being
+    # updated, so no amount of care here would have caught it.
+    if not os.environ.get('BRAIN_UPDATE_STAGED'):
+        staged_dir = tempfile.mkdtemp(prefix='brain-update-staged-')
+        staged = os.path.join(staged_dir, 'update')
+        new_self = os.path.join(src, 'bin', 'update')
+        if os.path.isfile(new_self) and differs(new_self, os.path.abspath(__file__)):
+            shutil.copy2(new_self, staged)
+            env = dict(os.environ,
+                       BRAIN_UPDATE_STAGED='1',
+                       BRAIN_UPDATE_SRC=src,
+                       BRAIN_UPDATE_STAGED_DIR=staged_dir)
+            if args.url:
+                env['BRAIN_UPDATE_CLONE'] = src
+            argv = [sys.executable, staged, '--target', ROOT]
+            if args.dry_run:
+                argv.append('--dry-run')
+            print('  ~ bin/update itself changed; running the new one so its '
+                  'own fixes apply')
+            sys.stdout.flush()
+            os.execve(sys.executable, argv, env)
+        shutil.rmtree(staged_dir, ignore_errors=True)
+
+    before = {} if args.dry_run else snapshot(ROOT)
+    changed, missing = [], []
+    recorded = load_manifest()
+    shipped = {}
+
+    for rel in GENERIC_DIRS:
+        a, d = os.path.join(src, rel), os.path.join(ROOT, rel)
+        if not os.path.isdir(a):
+            missing.append(rel)
+            continue
+        moved = 0
+        for sub in walk_rel(a):
+            sp, dp = os.path.join(a, sub), os.path.join(d, sub)
+            key = os.path.join(rel, sub)
+            shipped[key] = sha(sp)
+            if not upstream_changed(key, shipped[key], recorded, sp, dp):
+                continue
+            moved += 1
+            if not args.dry_run:
+                os.makedirs(os.path.dirname(dp), exist_ok=True)
+                shutil.copy2(sp, dp)
+        # Files upstream has dropped. rmtree+copytree used to handle this; it
+        # also rewrote every file on every run, which is what made the count
+        # permanently non-zero.
+        for sub in walk_rel(d) if os.path.isdir(d) else []:
+            if not os.path.isfile(os.path.join(a, sub)):
+                moved += 1
+                if not args.dry_run:
+                    os.remove(os.path.join(d, sub))
+        if moved:
+            changed.append(f'{rel}/  ({moved} file(s))')
+
+    for rel in GENERIC_FILES:
+        sp, dp = os.path.join(src, rel), os.path.join(ROOT, rel)
+        if not os.path.isfile(sp):
+            missing.append(rel)
+            continue
+        shipped[rel] = sha(sp)
+        if upstream_changed(rel, shipped[rel], recorded, sp, dp):
+            changed.append(rel)
+            if not args.dry_run:
+                os.makedirs(os.path.dirname(dp), exist_ok=True)
+                shutil.copy2(sp, dp)
+
+    # The templates ship with `<YYYY-MM-DD>` and `bin/adopt` stamps the install
+    # date into them. An update copied them unstamped, so a brain that had been
+    # stamped quietly went back to carrying the placeholder. Benign — `bin/new`
+    # substitutes it on every node it writes — but a diff nobody asked for.
+    if not args.dry_run:
+        today = date.today().isoformat()
+        tdir = os.path.join(ROOT, 'knowledge-catalog', 'reference',
+                            'agent-skills', 'templates')
+        for base, dirs, files in os.walk(tdir):
+            for f in files:
+                if not f.endswith('.md'):
+                    continue
+                fp = os.path.join(base, f)
+                text = open(fp, encoding='utf-8').read()
+                if '<YYYY-MM-DD>' in text:
+                    open(fp, 'w', encoding='utf-8').write(
+                        text.replace('<YYYY-MM-DD>', today))
+
+    # config.md is generic prose wrapped around install-time values. Copying
+    # it whole would lose mode/repos/brain_revision; not copying it froze a
+    # sentence pointing at a skill that no longer exists. So: upstream's body,
+    # this install's frontmatter.
+    local_cfg = os.path.join(ROOT, 'config.md')
+    src_cfg = os.path.join(src, 'config.md')
+    if os.path.isfile(src_cfg) and os.path.isfile(local_cfg):
+        mine = open(local_cfg, encoding='utf-8').read()
+        theirs = open(src_cfg, encoding='utf-8').read()
+        keep = mine[:mine.index('\n---', 3) + 5] if '\n---' in mine[3:] else ''
+        body = theirs[theirs.index('\n---', 3) + 5:] if '\n---' in theirs[3:] else ''
+        # Against upstream's body as shipped, not against the local copy.
+        # The merge wrote upstream's body — which cites D0004 by relative
+        # path — and the repoint then rewrote that citation to a URL. Next run
+        # the two differed again, so the merge fired again, forever: two
+        # correct transforms oscillating, each undoing the other, reported as
+        # "1 path(s) updated" over a tree that never settles.
+        body_sha = hashlib.sha1(body.encode()).hexdigest()
+        shipped['config.md:body'] = body_sha
+        fresh_body = recorded.get('config.md:body') != body_sha
+        if keep and body and (keep + body) != mine and fresh_body:
+            changed.append('config.md (prose only; your values kept)')
+            if not args.dry_run:
+                open(local_cfg, 'w', encoding='utf-8').write(keep + body)
+
+    # Record what we came from, so "did the update land" is a glance.
+    rev = subprocess.run(['git', '-C', src, 'rev-parse', '--short', 'HEAD'],
+                         capture_output=True, text=True)
+    if rev.returncode == 0 and not args.dry_run:
+        t = open(local_cfg, encoding='utf-8').read()
+        stamp = f'brain_revision: "{rev.stdout.strip()}"'
+        if re.search(r'^brain_revision:', t, re.M):
+            fresh = re.sub(r'^brain_revision: .*$', stamp, t, count=1, flags=re.M)
+        else:
+            # Insert it when absent. `bin/adopt` has done this for a while,
+            # with a comment naming the exact failure — "an install predating
+            # the field has no key to substitute into" — and `bin/update`
+            # never got the same fix. So the population the field exists for,
+            # old installs, could not gain it through the tool they actually
+            # use. One adopter updated and still had no revision recorded,
+            # which also silently disabled the "already current at <rev>"
+            # short-circuit for them.
+            fresh = re.sub(r'^(mode: .*)$', r'\1\n' + stamp, t, count=1,
+                           flags=re.M)
+        # Only when it actually moves. Rewriting it on every run put config.md
+        # in the change set of a run whose output said nothing had changed —
+        # found by `bin/prove`, on this tool, within a minute of writing it.
+        if fresh != t:
+            open(local_cfg, 'w', encoding='utf-8').write(fresh)
+
+    verb = 'would update' if args.dry_run else 'updated'
+    for c in changed:
+        print(f'  {verb} {c}')
+    for m in missing:
+        print(f'  absent from the source: {m}')
+
+    if args.dry_run:
+        print(f'\n  --dry-run: nothing written.')
+        return 0
+
+    if not changed:
+        rev = ''
+        cfg = os.path.join(ROOT, 'config.md')
+        if os.path.isfile(cfg):
+            m = re.search(r'^brain_revision:\s*"?([0-9a-f]{6,40})"?',
+                          open(cfg, encoding='utf-8').read(), re.M)
+            rev = m.group(1)[:7] if m else ''
+        at = f' at {rev}' if rev else ''
+        print(f'  Already current{at} — upstream has changed nothing since '
+              'this brain last updated.')
+
+    # The generic documents arrived citing knowledge-catalog/, where the
+    # adopter's own nodes now live. Put the citations back into example/.
+    subprocess.run([os.path.join(ROOT, 'bin', 'adopt'), '--repoint-only'],
+                   capture_output=True)
+
+    # The hook and the workflow are copies that live outside the brain, so an
+    # update of the brain leaves them on the old version. Refresh the ones
+    # that are already installed; never install one that is not.
+    host = os.path.dirname(ROOT)
+    wf = os.path.join(host, '.github', 'workflows', 'brain.yml')
+    if os.path.isfile(wf):
+        shutil.copy2(os.path.join(ROOT, '.github', 'workflows', 'brain.yml'), wf)
+        print('  refreshed .github/workflows/brain.yml')
+    hook = os.path.join(host, '.git', 'hooks', 'post-commit')
+    if os.path.isfile(hook) and not os.path.islink(hook):
+        shutil.copy2(os.path.join(ROOT, 'hooks', 'post-commit'), hook)
+        print('  refreshed .git/hooks/post-commit')
+
+    save_manifest(shipped)
+
+    # Announced, because they write files. A run that regenerates an index and
+    # a 300KB graph while reporting only the paths it copied leaves two files
+    # in the change set that the output does not account for.
+    for tool in ('index', 'graph-build'):
+        subprocess.run([os.path.join(ROOT, 'bin', tool)], capture_output=True)
+    print('  regenerated folder indexes and graph.html')
+
+    # Measured here, after the copy loop *and* the three transforms that
+    # follow it — the re-stamp, the repoint subprocess, and the config merge.
+    # Taken any earlier it misses exactly the files those transforms write,
+    # which is how a report that listed intentions went wrong in both
+    # directions for three releases running.
+    after = snapshot(ROOT)
+    touched = sorted(set(before) ^ set(after)) + sorted(
+        r for r in set(before) & set(after) if before[r] != after[r])
+    touched = [t for t in touched if t not in (MANIFEST, 'graph.html')]
+    print(f'\n  {len(touched)} file(s) changed, measured by content before and')
+    print('  after this run — not a list of what was attempted:')
+    for t in touched[:14]:
+        print(f'    {t}')
+    if len(touched) > 14:
+        print(f'    … and {len(touched) - 14} more')
+    print('\n  Your catalog, tasks, plans and config values were not touched.')
+    code = subprocess.run([os.path.join(ROOT, 'bin', 'doctor')]).returncode
+    print('\n  Then run `bin/lint`. Upstream nodes cited by the generic documents')
+    print('  live in `example/`, which an update does not bring; a link into it')
+    print('  may dangle, and that is better than resolving to a different node.')
+    return code
+
+
+def _cleanup():
+    """Remove what the re-exec left behind: the staged copy of this script,
+    and the clone the parent fetched before handing over."""
+    for var in ('BRAIN_UPDATE_STAGED_DIR', 'BRAIN_UPDATE_CLONE'):
+        d = os.environ.get(var)
+        if d and os.path.isdir(d) and 'brain-update' in os.path.basename(d):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+if __name__ == '__main__':
+    try:
+        code = main()
+    finally:
+        _cleanup()
+    sys.exit(code)

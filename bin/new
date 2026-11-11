@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Allocate the next id of a type and scaffold the node from its template.
+
+Usage:
+    brain/bin/new decision "Pin the model version at the commit"
+    brain/bin/new task "Add retry to the dispatcher" --initiative formalize
+    brain/bin/new evidence "Retry rates after the backoff change"
+    brain/bin/new --next decision        # just print the id
+
+Exit 1 if the type is unknown or the target already exists.
+
+## Why allocation is a tool and not a habit
+
+An id is only trustworthy if it is unique, and the failure mode is quiet: two
+people each writing `D0014` produce *different filenames*, so git merges both
+without a conflict (D0003). `bin/lint` catches the collision afterwards; this
+avoids it by never letting a number be chosen by hand.
+
+It also puts the id in the two places that must agree — the frontmatter and
+the filename prefix — which is the pair the linter checks.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+TEMPLATES = os.path.join(ROOT, 'knowledge-catalog', 'reference', 'agent-skills', 'templates')
+
+# type -> (id letter, destination relative to the brain, template file)
+KINDS = {
+    'goal':      ('G', 'knowledge-catalog/goals',     'goal.md'),
+    'decision':  ('D', 'knowledge-catalog/decisions', 'decision.md'),
+    'principle': ('D', 'knowledge-catalog/decisions', 'principle.md'),
+    'plan':      ('P', 'plans',                       'plan.md'),
+    'spec':      ('S', 'knowledge-catalog/specs',     'spec.md'),
+    'task':      ('T', 'tasks',                       'task.md'),
+    'evidence':  ('E', 'knowledge-catalog/reference', 'evidence.md'),
+}
+ID_IN_NAME = re.compile(r'^([GDPSTE])(\d{4})-')
+
+
+def used(letter):
+    """Every id of this letter anywhere in the brain — the sequence is global
+    (D0003), so a scan of one folder would not be enough."""
+    seen = set()
+    # `example/` is walked on purpose. It holds the template's own record, and
+    # after a default install its D0001 and a freshly issued D0001 sat in one
+    # tree — both the README and CLAUDE.md promise ids are flat and global, and
+    # every adopter got two of them on day one.
+    for base, dirs, files in os.walk(ROOT):
+        dirs[:] = [d for d in dirs if d not in {'.git', 'bin', 'templates', 'docs'}]
+        for name in files:
+            m = ID_IN_NAME.match(name)
+            if m and m.group(1) == letter:
+                seen.add(int(m.group(2)))
+    return seen
+
+
+def slugify(title):
+    s = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
+    return '-'.join(s.split('-')[:8])
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Allocate an id and scaffold a node.')
+    ap.add_argument('kind', choices=sorted(KINDS))
+    ap.add_argument('title', nargs='*')
+    ap.add_argument('--initiative', help='required for a task: the tasks/ subfolder')
+    ap.add_argument('--next', action='store_true', help='print the next id and stop')
+    args = ap.parse_args()
+
+    letter, dest, template = KINDS[args.kind]
+    taken = used(letter)
+    nxt = f'{letter}{(max(taken) + 1 if taken else 1):04d}'
+
+    if args.next:
+        print(nxt)
+        return 0
+
+    title = ' '.join(args.title).strip()
+    if not title:
+        print('Give the node a title.', file=sys.stderr)
+        return 1
+
+    folder = os.path.join(ROOT, dest)
+    if args.kind == 'task':
+        if not args.initiative:
+            print('A task needs --initiative (the tasks/ subfolder it belongs to).',
+                  file=sys.stderr)
+            return 1
+        folder = os.path.join(folder, args.initiative)
+    os.makedirs(folder, exist_ok=True)
+
+    path = os.path.join(folder, f'{nxt}-{slugify(title)}.md')
+    if os.path.exists(path):
+        print(f'{path} already exists.', file=sys.stderr)
+        return 1
+
+    body = open(os.path.join(TEMPLATES, template), encoding='utf-8').read()
+    body = re.sub(rf'^id: {letter}<NNNN>$', f'id: {nxt}', body, count=1, flags=re.M)
+    # Always quoted: a title with a colon in it is a YAML parse error, and
+    # a tool that scaffolds a node must not scaffold a broken one.
+    safe = title.replace('\\', '').replace('"', "'")
+    body = re.sub(r'^title: .*$', f'title: "{safe}"', body, count=1, flags=re.M)
+    from datetime import date
+    body = body.replace('<YYYY-MM-DD>', date.today().isoformat())
+    if args.initiative:
+        body = body.replace('<folder name>', args.initiative)
+
+    open(path, 'w', encoding='utf-8').write(body)
+    rel = os.path.relpath(path, ROOT)
+    print(rel)
+    # A scaffold is not yet a node, and `bin/lint` says so the moment it exists.
+    # Saying it here too means the first error an adopter sees is expected
+    # rather than alarming.
+    print('  It carries placeholders, so `bin/lint` will fail until you fill '
+          'them in.')
+
+    # The documentation promised that creating a node kept the indexes and the
+    # log in step, and nothing did it. A greenfield adopter finished with
+    # `goals/index.md` saying "(none yet)" beside three real goals, and
+    # hand-edited three files against an instruction not to.
+    # Order matters: the log is written first, then the indexes, then the
+    # graph — which is built from all of them. Building the graph before
+    # appending to the log left it stale the moment it was made.
+    log_line(nxt, title, rel)
+    for tool in ('index', 'graph-build'):
+        subprocess.run([os.path.join(ROOT, 'bin', tool)], capture_output=True)
+    return 0
+
+
+def log_line(ident, title, rel):
+    """One dated line in the change log. Appended, never regenerated: the log
+    is an account of what happened, in prose, and a generator would flatten it
+    into a list of filenames."""
+    from datetime import date
+    path = os.path.join(ROOT, 'knowledge-catalog', 'log.md')
+    if not os.path.isfile(path):
+        return
+    today = date.today().isoformat()
+    text = open(path, encoding='utf-8').read()
+    entry = f'**Creation** — [{ident}]({os.path.relpath(rel, "knowledge-catalog")}) {title}'
+
+    text = text.replace('*(nothing yet)*\n', '')
+
+    if f'## {today}' in text:
+        text = text.replace(f'## {today}\n', f'## {today}\n\n{entry}\n', 1)
+    else:
+        # A new day's heading goes above the newest existing one, or at the end
+        # if there is none. Never above the file's own preamble, which is what
+        # a naive split on the first blank line did.
+        m = re.search(r'^## ', text, re.M)
+        at = m.start() if m else len(text)
+        text = text[:at] + f'## {today}\n\n{entry}\n\n' + text[at:]
+    open(path, 'w', encoding='utf-8').write(re.sub(r'\n{3,}', '\n\n', text))
+
+
+
+if __name__ == '__main__':
+    sys.exit(main())

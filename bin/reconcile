@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Compare every task's status against what the repository actually shows.
+
+Usage:
+    brain/bin/reconcile [initiative] [--json]
+
+Exit 0 always. A task this cannot judge is a question for a person, not a
+failure — which is the whole point of the split below.
+
+## The split
+
+This produces **facts**; `/audit` supplies **judgement**. Same division as
+`bin/relevant` and `/grill-change`: a model asked to "check whether the
+statuses are right" will produce something status-shaped whether or not it
+looked, and a model handed "T0005 is In Progress, its branch merged three days
+ago, no journal entry in six" has been handed something it must engage with.
+
+So nothing here infers. It reports three buckets and refuses to collapse the
+third into either of the others:
+
+  * **reconciled** — status matches the evidence
+  * **determinable** — status is wrong and the evidence says so unambiguously
+  * **undeterminable** — honestly cannot tell
+
+The third bucket is the one that matters. A tool that guessed there would be
+wrong occasionally and trusted always, which is the worst combination.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+TASKS = os.path.join(ROOT, 'tasks')
+
+DONE = {'Complete', 'Delivered'}
+STARTED = {'In Progress', 'Testing', 'Complete', 'Delivered'}
+
+
+def git(*args):
+    out = subprocess.run(['git', '-C', ROOT, *args], capture_output=True, text=True)
+    return out.stdout if out.returncode == 0 else ''
+
+
+def frontmatter(text):
+    if not text.startswith('---'):
+        return {}
+    end = text.find('\n---', 3)
+    if end == -1:
+        return {}
+    out, key = {}, None
+    for line in text[3:end].split('\n'):
+        if re.match(r'^\s+-\s', line) and key:
+            out.setdefault(key, [])
+            if isinstance(out[key], list):
+                out[key].append(line.strip()[2:].strip().strip('"\''))
+            continue
+        if ':' not in line or line.startswith(' '):
+            continue
+        k, v = line.split(':', 1)
+        key, v = k.strip(), v.strip()
+        if v.startswith('[') and v.endswith(']'):
+            out[key] = [x.strip().strip('"\'') for x in v[1:-1].split(',') if x.strip()]
+        elif v == '':
+        # A key with no inline value opens a block sequence. Setting it to ''
+        # here made the `- item` lines below fall through `isinstance(..., list)`
+        # and vanish — so `constrains:` written the way most people write it
+        # governed nothing, past a green lint, silently switching off the
+        # payoff the README is built around.
+            out[key] = []
+        else:
+            out[key] = v.strip('"\'')
+    return out
+
+
+def tasks(initiative=None):
+    if not os.path.isdir(TASKS):
+        return
+    for folder in sorted(os.listdir(TASKS)):
+        d = os.path.join(TASKS, folder)
+        if not os.path.isdir(d) or (initiative and folder != initiative):
+            continue
+        for name in sorted(os.listdir(d)):
+            if not re.match(r'^T\d{4}-.*\.md$', name):
+                continue
+            meta = frontmatter(open(os.path.join(d, name), encoding='utf-8').read())
+            if meta.get('type') == 'task':
+                meta['_rel'] = os.path.relpath(os.path.join(d, name), ROOT)
+                yield meta
+
+
+def mentions(ident):
+    """Commits whose subject or body names this task id, with how strongly.
+
+    Returns (sha, subject, strong). `strong` is False when the id appears only
+    in prose *about identifiers* rather than as the work being done.
+
+    This grep is the whole evidence base, and it over-read. Two commits said
+    "numbering free at G0001/D0001/T0001" and "D0001 and T0001 free for the
+    adopter" — prose about which ids were still available — and `reconcile`
+    reported, under the header "Wrong, and the evidence is unambiguous", that
+    T0001 must be In Progress. Nobody had done a minute of work on it.
+
+    The tool's first rule is that it never guesses semantics, because its whole
+    value is that its output can be trusted without being re-checked. A verdict
+    built on a bare id in a sentence about id allocation breaks that rule while
+    claiming to be unambiguous, which is the shape of red output people learn
+    to scroll past.
+    """
+    log = git('log', '--all', f'--format=%H%x1f%s%x1f%b%x1e', f'--grep={ident}')
+    out = []
+    for record in log.split('\x1e'):
+        record = record.strip('\n')
+        if not record:
+            continue
+        parts = record.split('\x1f')
+        if len(parts) < 2:
+            continue
+        sha, subject, body = parts[0], parts[1], (parts[2] if len(parts) > 2 else '')
+        out.append((sha, subject, is_work_claim(ident, subject + '\n' + body)))
+    return out
+
+
+# Words that put a bare id in a sentence about *identifiers* rather than about
+# work: the id is being discussed as a number, not claimed as a task.
+ABOUT_IDS = re.compile(
+    r'\b(free|available|unused|reserved?|reserves|numbering|renumber\w*|'
+    r'collide|collision|allocat\w+|sequence|band|namespace)\b', re.I)
+
+
+def is_work_claim(ident, text):
+    """Does this commit name the id as the work it did?
+
+    One structural rule and one contextual one.
+
+    The id is not a claim when it sits in a run of other ids —
+    `G0001/D0001/T0001` is a statement about a numbering scheme, not three
+    tasks worked at once — or beside a word about identifiers.
+
+    A "mention in the subject or first paragraph only" rule was tried and
+    reverted: it broke five commits that legitimately name their task deeper
+    in the body, to fix one that quoted a task id while describing a bug. Each
+    refinement here makes the heuristic cleverer and less trustworthy, which
+    is why the *bucket* carries the real fix — see `judge`.
+
+    Conservative in the honest direction. A false weak reading sends a real
+    finding to `/audit`, where a person looks at it. A false strong reading
+    prints a wrong verdict and calls it unambiguous.
+    """
+    for m in re.finditer(re.escape(ident), text):
+        line = text[max(0, text.rfind('\n', 0, m.start()) + 1):]
+        line = line[:line.find('\n') if '\n' in line else len(line)]
+        near = text[max(0, m.start() - 24):m.end() + 24]
+        others = [o for o in re.findall(r'\b[GDPSTE]\d{4}\b', near) if o != ident]
+        if others:
+            continue
+        if ABOUT_IDS.search(line):
+            continue
+        return True
+    return False
+
+
+def merged(ident):
+    """Is a commit naming this task reachable from the default branch?"""
+    head = (git('symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD').strip()
+            or 'refs/heads/main')
+    base = head.rsplit('/', 1)[-1]
+    for sha, _, strong in mentions(ident):
+        if not strong:
+            continue
+        if git('merge-base', '--is-ancestor', sha, base) == '' and \
+           subprocess.run(['git', '-C', ROOT, 'merge-base', '--is-ancestor', sha, base],
+                          capture_output=True).returncode == 0:
+            return True
+    return False
+
+
+def judge(t):
+    """Return (bucket, one-line finding). Never a guess."""
+    ident, status = t.get('id', '?'), t.get('status', '?')
+    every = mentions(ident)
+    seen = [m for m in every if m[2]]
+    weak = [m for m in every if not m[2]]
+
+    def only_weak(verb):
+        return ('undeterminable',
+                f'{status}, and {len(weak)} commit(s) mention {ident} only in '
+                f'prose about identifiers — not evidence that {verb}')
+
+    if status in ('Not Ready', 'Ready for Development') and weak and not seen:
+        return only_weak('work has started')
+    if status in DONE and not seen:
+        extra = (f' {len(weak)} mention it only in prose about identifiers.'
+                 if weak else '')
+        return 'undeterminable', (f'{status}, but no commit names {ident} as its '
+                                  f'work.{extra} Was it done under another id, '
+                                  f'or not done?')
+    # Prose evidence never earns "unambiguous".
+    #
+    # A commit message naming an id is the weakest signal this tool has: it
+    # cannot distinguish a commit *doing* T0001 from one *writing about*
+    # T0001, and in a repository whose commits discuss their own task ids —
+    # this one does, constantly — that is a live ambiguity rather than an edge
+    # case. Two keyword passes at telling them apart each misfired, the second
+    # on the very commit that fixed the first.
+    #
+    # So the honest bucket is "cannot tell", which is where /audit and a person
+    # look. The finding is not lost and the certainty is not claimed. Only the
+    # Testing case below stays determinable, because its evidence is git
+    # ancestry rather than English.
+    if status in ('Not Ready', 'Ready for Development') and seen:
+        return 'undeterminable', (f'{status}, but {len(seen)} commit(s) name '
+                                  f'{ident} — started, or just discussed?')
+    if status == 'Testing':
+        if merged(ident):
+            return 'determinable', f'Testing, and its commits are merged — candidate for Complete'
+        return 'reconciled', 'Testing, not yet merged'
+    if status == 'In Progress' and not t.get('claimed_by'):
+        return 'undeterminable', 'In Progress with no `claimed_by` — who holds it?'
+    if status in STARTED and seen:
+        return 'reconciled', f'{status}, {len(seen)} commit(s)'
+    return 'reconciled', status
+
+
+def orphans():
+    """Commits since the last audit that name no task at all.
+
+    Status drift makes the brain *wrong*. Orphan work makes it *incomplete*,
+    which is harder to notice because the graph still looks healthy.
+    """
+    known = {t.get('id') for t in tasks()}
+    out = []
+    for line in git('log', '--format=%h%x1f%s', '-50').splitlines():
+        if not line:
+            continue
+        sha, subject = line.split('\x1f')
+        if not any(k and k in subject for k in known):
+            out.append((sha, subject))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Task status against the repository.')
+    ap.add_argument('initiative', nargs='?')
+    ap.add_argument('--json', action='store_true')
+    args = ap.parse_args()
+
+    buckets = {'reconciled': [], 'determinable': [], 'undeterminable': []}
+    for t in tasks(args.initiative):
+        bucket, note = judge(t)
+        buckets[bucket].append({'id': t.get('id'), 'title': t.get('title', ''),
+                                'status': t.get('status'), 'path': t['_rel'], 'note': note})
+
+    unlinked = orphans()
+
+    if args.json:
+        print(json.dumps({**buckets, 'orphan_commits': unlinked}, indent=2))
+        return 0
+
+    total = sum(len(v) for v in buckets.values())
+    if not total:
+        print('No tasks to reconcile.')
+    else:
+        print(f'{total} task(s): {len(buckets["reconciled"])} reconciled, '
+              f'{len(buckets["determinable"])} determinable, '
+              f'{len(buckets["undeterminable"])} undeterminable')
+        print()
+
+    for name, header in (('determinable', 'Wrong, and the evidence is unambiguous'),
+                         ('undeterminable', 'Cannot tell — these need a person')):
+        if buckets[name]:
+            print(f'  {header}')
+            for r in buckets[name]:
+                print(f"    {r['id']}  {r['title']}")
+                print(f"        {r['note']}")
+            print()
+
+    if unlinked:
+        print(f'  {len(unlinked)} recent commit(s) name no task:')
+        for sha, subject in unlinked[:8]:
+            print(f'    {sha}  {subject[:72]}')
+        if len(unlinked) > 8:
+            print(f'    … and {len(unlinked) - 8} more')
+        print()
+        print('  Unrecorded work, or work done under a task that was never cited.')
+        print('  This reads commit *messages* for a bare task id — `T0007` '
+              'anywhere in')
+        print('  the subject or body. Nothing enforces it and nothing breaks '
+              'without it;')
+        print('  a brain whose commits never name a task simply gets no '
+              'status reconciliation.')
+
+    if total and not buckets['determinable'] and not buckets['undeterminable']:
+        print('  Every status matches the repository.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

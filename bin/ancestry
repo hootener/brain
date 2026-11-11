@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""Walk backwards from a task to everything that asked for it.
+
+Usage:
+    brain/bin/ancestry 022
+    brain/bin/ancestry 022 027 --json
+    brain/bin/ancestry 022 --claims     # also pull each ancestor's assertions
+
+Exit 0 always. An orphan task with no ancestry is a finding for a reader, not
+an error for a script.
+
+## Why walk backwards
+
+A code review reads a diff against its acceptance criteria, and a diff can
+satisfy every criterion while drifting from the thing that was actually
+wanted. The criteria are the *last* link in a chain — a task comes from a
+plan, a plan carries out decisions, and the decisions are where the reasoning
+lives. Only the chain can answer the two questions worth asking after the
+work is done:
+
+  1. **Does the change still serve the why?** The spec said one thing, the
+     plan may have widened it, and the code satisfies the plan. Nobody has
+     been back to the spec sentence.
+
+  2. **Did the build invalidate anything upstream?** Every ancestor makes
+     claims. After the work, some are false. The output of a review is
+     therefore not only findings on the code but a list of documents to
+     amend — which is the catalog's supersede-don't-delete rule applied at the
+     one moment it matters.
+
+This has already paid for itself here. Decision 0003 described a webhook and
+the Check Runs API; ticket 017 built dispatch-and-polling and a commit status,
+and nobody walked back up to 0003 for two days. The amendment it now carries
+is exactly what this walk is meant to produce *at the time*.
+
+## Three classes of edge, not one
+
+The first version had a single notion of "edge" and it conflated three things
+a reviewer needs to tell apart:
+
+  * **Lineage** — `spec`, `serves`, `plan`, and body links. Traversed. This is
+    the chain, and `serves` is what finally reaches Intent: before it existed,
+    a decision was reachable only through a prose link no skill wrote, and
+    deleting two such links from a spec silently dropped a five-task closure
+    to zero decisions and zero goals.
+  * **Scheduling** — `blocked_by`. **Not followed at all.** A blocker is not an
+    ancestor: it means 003 had to land first, not that 003 asked for 005.
+    Following it made the closure grow with the *dependency chain* rather than
+    the intent depth, so reviewing task 030 of a linear initiative dragged in
+    001 through 029. Measured on a five-task fixture: eight documents returned,
+    five of them sideways peers. `bin/status` owns this edge; a review does not
+    need it.
+  * **Correction** — `superseded_by` and `amends`. Traversed *even though they
+    point forward in time*, which is the sanctioned exception to D0002. A
+    reviewer who reaches a superseded decision must be carried to what replaced
+    it; being told `· superseded` and left there is the worst outcome this tool
+    has.
+
+## Completeness
+
+Every branch must terminate at a `goal` or a `principle`. One that dies at a
+spec is **unterminated**, and that is reported first — above any other finding —
+because it means work shipped with no recorded intent. Before this, a thin
+closure and a complete one looked identical.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+TASKS = os.path.join(ROOT, 'tasks')  # every initiative folder beneath it
+
+SKIP_WALK = {'.git', 'bin', 'templates', 'docs', 'example'}
+
+LINK = re.compile(r'\[[^\]]*\]\(([^)\s#]+\.md)(?:#[^)]*)?\)')
+
+# Navigation, not ancestry. An index links to everything in its folder, so
+# following one turns a walk of six documents into a walk of sixty-two — the
+# same hub problem `bin/relevant` hit, in a different costume. A task's
+# lineage never runs *through* a table of contents.
+HUBS = {'index.md', 'README.md', 'TODO.md'}
+
+# Sentences that assert something a build can falsify. A description is always
+# a claim — it is the one-line promise the document makes — and in the body it
+# is the modal verbs that carry weight.
+ASSERTING = re.compile(
+    r'\b(must|will|never|always|cannot|is the|are the|does not|shall|'
+    r'every|only|no \w+ (?:can|may)|requires?)\b', re.I,
+)
+
+
+def frontmatter(text):
+    """Flat YAML plus block lists, the same shape `bin/status` needed."""
+    if not text.startswith('---'):
+        return {}, text
+
+    end = text.find('\n---', 3)
+    if end == -1:
+        return {}, text
+
+    out, key = {}, None
+
+    for line in text[3:end].split('\n'):
+        if re.match(r'^\s+-\s', line) and key:
+            out.setdefault(key, [])
+            if isinstance(out[key], list):
+                out[key].append(line.strip()[2:].strip().strip('"\''))
+            continue
+
+        if ':' not in line or line.startswith(' '):
+            continue
+
+        k, v = line.split(':', 1)
+        key, v = k.strip(), v.strip()
+
+        if v.startswith('[') and v.endswith(']'):
+            out[key] = [x.strip().strip('"\'') for x in v[1:-1].split(',') if x.strip()]
+        elif v:
+            out[key] = v.strip('"\'')
+        else:
+        # A key with no inline value opens a block sequence. Setting it to ''
+        # here made the `- item` lines below fall through `isinstance(..., list)`
+        # and vanish — so `constrains:` written the way most people write it
+        # governed nothing, past a green lint, silently switching off the
+        # payoff the README is built around.
+            out[key] = []
+
+    return out, text[end + 4:]
+
+
+def read(path):
+    try:
+        return open(path, encoding='utf-8').read()
+    except OSError:
+        return None
+
+
+def resolve(origin, href):
+    return os.path.normpath(os.path.join(os.path.dirname(origin), href))
+
+
+def node_path(ref):
+    """Resolve `T0022`, `22`, `T0022-slug`, `<initiative>/T0022`, or a path.
+
+    **Ambiguity is an error, not a coin toss.** The old version took the
+    first match in folder sort order and said nothing, so two initiatives
+    each holding an `022` produced the wrong lineage silently. Ids are
+    global now (D0003), so a collision here also means the linter has
+    something to say.
+    """
+    if os.path.isfile(ref):
+        return os.path.abspath(ref), None
+
+    folder, _, leaf = ref.rpartition('/')
+    if leaf.isdigit():                       # `22` is how people say `T0022`
+        leaf = 'T%04d' % int(leaf)
+
+    roots = [os.path.join(TASKS, folder)] if folder else [ROOT]
+    hits = []
+    for base in roots:
+        for here, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in SKIP_WALK]
+            hits += [os.path.join(here, f) for f in files
+                     if f.startswith(leaf) and f.endswith('.md')]
+
+    if len(hits) > 1:
+        names = ', '.join(sorted(os.path.relpath(h, ROOT) for h in hits))
+        return None, '`%s` matches %d nodes: %s' % (ref, len(hits), names)
+    return (hits[0], None) if hits else (None, 'no node matching `%s`' % ref)
+
+def kind_of(path, meta):
+    """The declared type. Folders no longer vote.
+
+    This used to sniff `/experiments/` and `/reference/` out of the path,
+    because `context` covered both a measurement and a stack fact and the
+    difference mattered to the ordering. D0002 named `evidence`, so the
+    declared type is now sufficient and the path hack is gone.
+    """
+    return meta.get('type') or 'document'
+
+
+# Nearest first, because a reader starts at the task and walks outward, and
+# because a decision is where the walk is going.
+ORDER = {'task': 0, 'spec': 1, 'plan': 2, 'evidence': 3,
+         'decision': 4, 'principle': 4, 'goal': 5, 'glossary': 6}
+
+# The four categories of D0002. The reverse walk groups by these because each
+# asks the reviewer a different question, which is what makes a twenty-document
+# closure readable rather than a list.
+CATEGORY = {'goal': 'Intent', 'principle': 'Intent', 'decision': 'Intent',
+            'plan': 'Approach', 'spec': 'Approach',
+            'task': 'Action', 'evidence': 'Evidence'}
+CATEGORY_ORDER = ['Action', 'Approach', 'Intent', 'Evidence', 'other']
+QUESTION = {
+    'Intent':   'Is every claim here still true, and does the change still serve it?',
+    'Approach': 'Did we take the route we said, or did it widen without being argued?',
+    'Action':   'What did neighbouring work establish that this depends on?',
+    'Evidence': 'Does anything measured here contradict the Intent above it?',
+}
+
+# Where a branch is allowed to stop. Reaching one of these is the point.
+# A lineage terminates in Intent. A goal or a principle is the strongest form
+# of that; **a decision is also Intent**, and for some projects it is the only
+# form the intent ever takes.
+#
+# A consulting project put this plainly: intent arrives from outside, as prose,
+# at 20:51 on a Monday. Its brain holds 29 evidence nodes, 23 decisions and
+# zero plans — "structural, not lazy" — so every task reported UNTERMINATED and
+# the operator stopped running this. Their ask was not "let me write plans to
+# satisfy a linter"; it was to let a lineage terminate on a decision and say
+# which kind of termination it found. That is the right ask: `goal` and
+# `decision` are both Intent in D0002's own table.
+TERMINATES = {'goal', 'principle', 'decision'}
+
+# The distinction is kept in the report rather than in the rule, because the
+# two are not equally strong: a goal says what outcome the work is for, a
+# decision says what constraint it must respect.
+STRONGEST = {'goal', 'principle'}
+
+# **Where the walk stops: a type, not a distance.**
+#
+# These are the *why* layer. They are included — reaching them is the point —
+# but nothing is followed out of them, because a decision links to the
+# glossary, the glossary links to the rules of engagement, and two hops later
+# the closure is the entire brain.
+#
+# A depth cap was the first bound and it was the wrong shape. It cut at an
+# arbitrary radius, so a decision three hops out was dropped while a
+# decision's neighbour's neighbour two hops out was kept. Distance is not what
+# makes a document relevant; being an answer to "why" is. The reviewer reads
+# the closure, not the graph.
+TERMINAL = {'decision', 'principle', 'goal', 'glossary', 'evidence'}
+
+# Followed out of a TERMINAL node anyway: these carry the reader to what
+# replaced or corrected it, which is the one thing they must not miss.
+CORRECTION = ('superseded_by', 'amends')
+
+# And never sideways into other work. A task from another initiative is
+# somebody else's lineage, and reaching it means the walk has left the
+# question it was asked.
+INITIATIVES = os.path.join(ROOT, 'tasks')
+
+
+def walk(seeds, with_claims=False, max_depth=12):
+    seen = {}
+    queue = [(s, 0, 'seed') for s in seeds]
+
+    # Whichever initiative the seeds belong to; the walk may read that one's
+    # tasks and no other's.
+    initiative = next(
+        (os.path.dirname(s) for s in seeds if s.startswith(INITIATIVES)), None,
+    )
+
+    while queue:
+        path, depth, via = queue.pop(0)
+
+        # A safety rail against a cycle the `seen` set somehow misses, not
+        # the bound. The bound is TERMINAL.
+        if path in seen or depth > max_depth:
+            continue
+
+        if os.path.basename(path) in HUBS:
+            continue
+
+        if path.startswith(INITIATIVES) and initiative and os.path.dirname(path) != initiative:
+            continue
+
+        text = read(path)
+
+        if text is None:
+            continue
+
+        meta, body = frontmatter(text)
+        kind = kind_of(path, meta)
+
+        entry = {
+            'path': os.path.relpath(path, os.path.dirname(ROOT)),
+            'kind': kind,
+            'id': meta.get('id') or '',
+            'title': meta.get('title') or os.path.basename(path),
+            'status': meta.get('status') or '',
+            'description': meta.get('description') or '',
+            'depth': depth,
+
+            # Which edge reached it. `blocked_by` and `spec` are genuinely
+            # upstream; a body link can point either way, and a reader
+            # deciding whether a document is an ancestor or merely a mention
+            # needs to know which they are looking at.
+            'via': via,
+        }
+
+        if with_claims:
+            entry['claims'], entry['held_back'] = claims_in(body)
+
+        seen[path] = entry
+
+        # Correction edges are followed out of everything, terminal included:
+        # see CORRECTION above.
+        nexts = []
+        for field in CORRECTION:
+            v = meta.get(field) or []
+            for target in ([v] if isinstance(v, str) else v):
+                nexts.append((resolve(path, target), field))
+
+        # `serves` is followed out of everything, terminal included: it can
+        # only reach a goal, so it cannot blow the closure open, and it is the
+        # single hop that lets a branch terminate at Intent at all.
+        for target in ([v] if isinstance(v := meta.get('serves') or [], str) else v):
+            nexts.append((resolve(path, target), 'serves'))
+
+        if kind not in TERMINAL:
+            for field in ('spec', 'plan'):
+                v = meta.get(field) or []
+                for target in ([v] if isinstance(v, str) else v):
+                    nexts.append((resolve(path, target), field))
+
+            for href in LINK.findall(body):
+                nexts.append((resolve(path, href), 'link'))
+
+        # `blocked_by` is deliberately absent: it is scheduling, not lineage.
+
+        for n, edge in nexts:
+            if n not in seen and os.path.isfile(n) and n.startswith(ROOT):
+                queue.append((n, depth + 1, edge))
+
+    return sorted(seen.values(), key=lambda e: (ORDER.get(e['kind'], 9), e['depth'], e['path']))
+
+
+def claims_in(body, limit=24):
+    """Lines that assert something a build could have made false.
+
+    Two fixes over the first version, both measured. It capped at **four**
+    and said nothing about the rest — nine assertions in one decision
+    surfaced four — which is a defect in a tool whose stated deliverable is
+    the amendment list. And it skipped any line starting with `|`, `#` or
+    `>`, which is exactly where a spec puts its acceptance criteria. The cap
+    is now high and, when it bites, the caller is told how many were held
+    back rather than left to assume there were none.
+    """
+    out, fenced, para = [], False, []
+
+    def flush():
+        """One paragraph, rewrapped, then split into sentences.
+
+        Scanning physical lines reported a claim wrapped across two of them as
+        two fragments, each beginning mid-sentence — unreadable as a citation,
+        which is the only thing a claim is for.
+        """
+        if not para:
+            return
+        text = ' '.join(para)
+        for sentence in re.split(r'(?<=[.!?])\s+', text):
+            sentence = sentence.strip()
+            if len(sentence) >= 40 and ASSERTING.search(sentence):
+                out.append(sentence[:180])
+        para.clear()
+
+    for line in body.split(chr(10)):
+        if line.strip().startswith('```'):
+            fenced = not fenced
+            flush()
+            continue
+        if fenced:
+            continue
+
+        stripped = re.sub(r'\s+', ' ', line.strip())
+        if not stripped:
+            flush()
+            continue
+        if stripped.startswith('|'):
+            if set(stripped) <= set('|- :'):          # the separator row
+                continue
+            flush()
+            out_row = ' '.join(c.strip() for c in stripped.strip('|').split('|'))
+            if len(out_row) >= 40 and ASSERTING.search(out_row):
+                out.append(out_row[:180])
+            continue
+        if stripped.startswith('#'):
+            flush()
+            continue
+        para.append(stripped.lstrip('>-* ').strip())
+
+    flush()
+
+    return out[:limit], max(0, len(out) - limit)
+
+def descendants(seeds, max_depth=12):
+    """Walk *forward*: everything this intent asked for, and where it got to.
+
+    The backward walk answers "why was this built". It cannot answer the other
+    half of whether we did what we expected: **what did this intent ask for
+    that we never built?** A goal with four specs where three shipped and one
+    was quietly dropped is invisible to a reverse walk, and so is a spec whose
+    last two tasks sat at Not Ready while the initiative was declared done.
+
+    That is omission rather than drift, and it is the failure a green test
+    suite hides best.
+    """
+    index = {}
+    for base, dirs, files in os.walk(ROOT):
+        dirs[:] = [d for d in dirs if d not in SKIP_WALK]
+        for name in files:
+            if not name.endswith('.md') or name in HUBS:
+                continue
+            path = os.path.join(base, name)
+            text = read(path)
+            if text is None:
+                continue
+            meta, body = frontmatter(text)
+            if not meta.get('type'):
+                continue
+            targets = set()
+            for field in ('spec', 'serves', 'plan', 'amends', 'reviewed'):
+                v = meta.get(field) or []
+                for t in ([v] if isinstance(v, str) else v):
+                    targets.add(resolve(path, t))
+            for href in LINK.findall(body):
+                targets.add(resolve(path, href))
+            index[path] = (meta, targets)
+
+    out, queue, seen = [], [(s, 0) for s in seeds], set()
+    while queue:
+        path, depth = queue.pop(0)
+        if path in seen or depth > max_depth:
+            continue
+        seen.add(path)
+        meta = index.get(path, ({}, set()))[0]
+        if depth:
+            out.append({
+                'path': os.path.relpath(path, os.path.dirname(ROOT)),
+                'kind': meta.get('type') or 'document',
+                'title': meta.get('title') or os.path.basename(path),
+                'status': meta.get('status') or '',
+                'id': meta.get('id') or '',
+                'depth': depth,
+            })
+        for child, (_, targets) in index.items():
+            if path in targets and child not in seen:
+                queue.append((child, depth + 1))
+    return out
+
+
+OPEN_TASK = {'Not Ready', 'Ready for Development', 'In Progress', 'Testing'}
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description='What asked for this node, or what it asked for.')
+    ap.add_argument('nodes', nargs='+', help='ids, names or paths')
+    ap.add_argument('--claims', action='store_true', help="pull each ancestor's assertions")
+    ap.add_argument('--forward', action='store_true',
+                    help='walk downstream instead: what this intent asked for')
+    ap.add_argument('--depth', type=int, default=12, help='safety rail against cycles')
+    ap.add_argument('--json', action='store_true')
+    args = ap.parse_args()
+
+    seeds, problems = [], []
+    for ref in args.nodes:
+        path, why = node_path(ref)
+        (seeds.append(path) if path else problems.append(why))
+
+    for why in problems:
+        print(why[0].upper() + why[1:] + '.', file=sys.stderr)
+    if not seeds:
+        return 0
+
+    names = ', '.join(os.path.basename(s) for s in seeds)
+
+    if args.forward:
+        found = descendants(seeds, max_depth=args.depth)
+        if args.json:
+            print(json.dumps({'seeds': names, 'descendants': found}, indent=2))
+            return 0
+        print('What %s asked for' % names)
+        print('  %d node(s) downstream' % len(found))
+        print()
+        outstanding = [e for e in found if e['status'] in OPEN_TASK]
+        for e in sorted(found, key=lambda e: (ORDER.get(e['kind'], 9), e['path'])):
+            flag = '  ← outstanding' if e['status'] in OPEN_TASK else ''
+            print('  [%s] %s %s%s' % (e['kind'], e['id'], e['title'], flag))
+            print('      %s%s' % (e['path'], ('  · ' + e['status']) if e['status'] else ''))
+        print()
+        if outstanding:
+            print('  %d of these are not done. An intent is complete when nothing' % len(outstanding))
+            print('  it asked for is outstanding — omission, not drift, and a green')
+            print('  test suite will not show it.')
+        elif not found:
+            # "Everything landed" is the wrong answer when nothing was ever
+            # asked for. An initiative with no specs and no tasks has had
+            # nothing requested of it, and saying it is complete is a false
+            # all-clear on the emptiest possible state.
+            print('  Nothing downstream at all — no spec, no task. This intent has')
+            print('  not been asked for yet, which is not the same as satisfied.')
+        else:
+            print('  Nothing outstanding: everything this asked for has landed.')
+        return 0
+
+    found = walk(seeds, with_claims=args.claims, max_depth=args.depth)
+    terminal = [e for e in found if e['kind'] in TERMINATES]
+
+    if args.json:
+        print(json.dumps({'seeds': names, 'ancestry': found,
+                          'terminates_at': [e['id'] for e in terminal if e.get('id')],
+                          'unterminated': not terminal}, indent=2))
+        return 0
+
+    print('Ancestry of %s' % names)
+    print('  %d document(s) upstream' % len(found))
+    print()
+
+    # Reported before anything else: a closure that never reaches Intent is a
+    # finding about the record, not a quieter review.
+    if not terminal:
+        print('  ⚠ UNTERMINATED — no branch reaches a goal, a principle or a '
+              'decision.')
+        print('    This work has no recorded intent to be checked against.')
+        print('    Give the spec or plan a `serves:` before reviewing the code.')
+        print()
+    else:
+        print('  terminates at: %s' % ', '.join(
+            '%s %s' % (e.get('id') or '', e['title']) for e in terminal))
+        if not any(e['kind'] in STRONGEST for e in terminal):
+            print('    on a decision, not a goal — the recorded intent is a '
+                  'constraint this')
+            print('    work must respect rather than an outcome it was asked '
+                  'to reach. Normal')
+            print('    where intent arrives from outside; worth a goal if you '
+                  'ever want to ask')
+            print('    whether the work was worth doing.')
+        print()
+
+    by_cat = {}
+    for e in found:
+        by_cat.setdefault(CATEGORY.get(e['kind'], 'other'), []).append(e)
+
+    for cat in CATEGORY_ORDER:
+        group = by_cat.get(cat)
+        if not group:
+            continue
+        print(('  ── %s ' % cat.upper()).ljust(58, '─'))
+        if cat in QUESTION:
+            print('     %s' % QUESTION[cat])
+        print()
+        for e in sorted(group, key=lambda e: (ORDER.get(e['kind'], 9), e['depth'])):
+            stale = '  ⚠ SUPERSEDED' if e['status'] in ('superseded', 'deprecated') else ''
+            print('  %s %s%s' % (e.get('id') or '', e['title'], stale))
+            print('      %s%s%s' % (
+                e['path'],
+                ('  · ' + e['status']) if e['status'] else '',
+                '' if e['via'] == 'seed' else '  · via ' + e['via']))
+            if e['description']:
+                print('      promises: %s' % e['description'][:150])
+            for claim in e.get('claims', []):
+                print('      claims:   %s' % claim)
+            if e.get('held_back'):
+                print('      … and %d more assertion(s) — raise --depth of reading, '
+                      'not of the walk' % e['held_back'])
+            print()
+
+    print('  Two questions, in this order:')
+    print()
+    print('    1. Does the change still serve the why? A diff can satisfy every')
+    print('       acceptance criterion and still drift from what was promised')
+    print('       further up. Read the promises above against what was built.')
+    print()
+    print('    2. Did the build invalidate anything here? Each of these makes')
+    print('       claims; some are now false. Amend them — supersede, do not')
+    print('       delete — and the list of amendments is half the review.')
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

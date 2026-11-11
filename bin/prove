@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""Check whether a tool's output agrees with what it did to the filesystem.
+
+Usage:
+    brain/bin/prove bin/update --from https://github.com/hootener/brain.git
+    brain/bin/prove bin/adopt --sibling
+    brain/bin/prove --no-dry bin/index
+
+Exit 0 if every assertion holds, 1 otherwise.
+
+## Why this exists
+
+This is not the author's idea. It was proposed, in almost this form, by the
+third project to adopt the brain, as the answer to a question the author had
+asked it twice: *is there anything an adopter could be asked to run, once,
+that would have caught any of these defects?*
+
+Their observation is the one that matters, and it took four rounds of reports
+to see: **nearly every defect was the tool's stdout disagreeing with the
+filesystem.** Not wrong behaviour — wrong *reporting* about behaviour.
+
+  * `bin/adopt --dry-run` wrote 22 files while printing "nothing written".
+  * A citation rewrite turned 55 of an adopter's own links into 404s, and
+    said it had repointed 12 generic documents.
+  * `bin/adopt` took a `log.md` from 12,339 bytes to 97 and mentioned nothing.
+  * `bin/update` announced four unchanged directories as updated, then — once
+    that was fixed — announced six paths and 7 files while changing nothing.
+  * `bin/update` could not apply its own fixes, so two consecutive identical
+    runs behaved differently and neither said so.
+
+Every one of those is visible to three assertions around the command, with no
+fixture, no CI, and no knowledge of what the brain contains. By their count it
+catches seven of the twelve defects found across four adoptions, **including
+all three the author had reported as verified and which were not**.
+
+## The blind spot, which an adopter found
+
+**It tests from the current state, so a false claim made by the run that
+changed things is invisible to it.** By the time you point `prove` at a tool
+that has already done its work, the tool is a no-op and honestly reports doing
+nothing — which passes, correctly, while the claim that was wrong has already
+scrolled past.
+
+That is exactly how `bin/update`'s report stayed wrong across three releases.
+`prove` was run on it repeatedly and passed every time, because every run was
+the second one.
+
+The fix is not in `prove` — it cannot see a past it was not present for. It is
+in the tool: `bin/update` now hashes the tree before and after itself and
+reports the difference, so its account is derived from what happened rather
+than from what it meant to do. **A tool that reports a measurement does not
+need this one.**
+
+## What it cannot do
+
+It cannot tell you the tool chose the wrong plan, that an image will 404, that
+a date is missing from a page, or that a test is measuring its host. Those need
+someone who knows what the output *should* say. The line is sharp and worth
+keeping in view: this proves a tool is honest about what it did, never that
+what it did was right.
+"""
+import argparse
+import hashlib
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+SKIP = {'.git', 'node_modules', '__pycache__'}
+
+
+def snap(root):
+    """Hash, size and mtime of every file.
+
+    mtime is in deliberately: a tool that rewrites a file to identical bytes
+    has still written it, and a dry run that does so is still lying. Hash
+    alone would call that clean.
+    """
+    out = {}
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP]
+        for name in files:
+            path = os.path.join(base, name)
+            rel = os.path.relpath(path, root)
+            try:
+                with open(path, 'rb') as fh:
+                    digest = hashlib.sha1(fh.read()).hexdigest()
+                st = os.stat(path)
+            except OSError:
+                continue
+            # Nanoseconds, not seconds. `int(st.st_mtime)` made a rewrite to
+            # identical bytes invisible inside a one-second window, which is
+            # the whole case this docstring argues for. Treating the symptom
+            # (exempting announced files from the idempotence assertion) moved
+            # it into the adjacent assertion instead: the run said "wrote
+            # graph.html: 158 nodes, 334 edges" and four lines later "changed:
+            # 0 file(s) — output and filesystem agree."
+            out[rel] = (digest, st.st_size, st.st_mtime_ns)
+    return out
+
+
+def delta(a, b):
+    """(added, removed, changed) between two snapshots."""
+    added = sorted(set(b) - set(a))
+    removed = sorted(set(a) - set(b))
+    changed = sorted(r for r in set(a) & set(b) if a[r] != b[r])
+    return added, removed, changed
+
+
+def show(label, added, removed, changed, limit=12):
+    total = len(added) + len(removed) + len(changed)
+    print(f'  {label}: {total} file(s)')
+    for kind, group in (('+', added), ('-', removed), ('~', changed)):
+        for rel in group[:limit]:
+            print(f'      {kind} {rel}')
+        if len(group) > limit:
+            print(f'      {kind} … and {len(group) - limit} more')
+    return total
+
+
+def invoke(cmd, cwd, extra=()):
+    """Run it, and keep the return code.
+
+    This discarded `p.returncode`, which made the dry-run assertion pass over
+    a command that never executed: `bin/index` uses argparse, so `--dry-run` is
+    a fatal unknown flag, and a command that did not run writes nothing. The
+    result was `[ ok ] --dry-run changed nothing` over a deliberately stale
+    index — a false *reassurance* inside the tool built to catch false
+    reassurances, and the first clean case of a tool being wrong about itself.
+    """
+    full = list(cmd) + list(extra)
+    p = subprocess.run(full, cwd=cwd, capture_output=True, text=True)
+    return p.returncode, p.stdout + p.stderr
+
+
+def advertises_dry_run(cmd, cwd):
+    """Does this tool offer a --dry-run at all?
+
+    Asked of `--help`, because the two ways of not having one are
+    indistinguishable from the outside otherwise: argparse *rejects* the flag
+    (exit 2, nothing written, which made the assertion pass vacuously), while a
+    hand-rolled argv loop silently *ignores* it and writes (which made the
+    assertion accuse an honest tool of lying — `bin/graph-build` has no dry run
+    and never claimed one).
+
+    14 of the 20 tools here have no dry run and five of those write, so this is
+    the common case. A tool that advertises one and then writes is the defect
+    worth shouting about, and it is the one this still catches.
+    """
+    code, out = invoke(cmd, cwd, ['--help'])
+    return '--dry-run' in out
+
+
+def rejected_flag(code, out):
+    """argparse's fatal unknown-flag exit."""
+    return code == 2 and ('unrecognized arguments' in out or 'usage:' in out)
+
+
+def named_in(out, rel):
+    """Does the tool's own output mention this path?
+
+    Assertion 2 already holds a tool to this standard — "a file nobody
+    mentioned is the finding" — and assertion 3 had no notion of it. So a
+    legitimately regenerated derived file, announced on stdout, read as an
+    idempotence violation: `graph.html` carries a second-resolution build
+    stamp, which made the whole assertion depend on whether two runs straddled
+    a second boundary. Four failures in six identical attempts. A check that is
+    right two times in six is worse than no check, because it teaches you to
+    re-run until it goes green.
+    """
+    base = os.path.basename(rel)
+    return rel in out or base in out
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Does this tool's output agree with what it did?")
+    ap.add_argument('command', nargs=argparse.REMAINDER,
+                    help='the tool and its arguments')
+    ap.add_argument('--root', default=ROOT,
+                    help='the tree to watch (default: this brain)')
+    ap.add_argument('--no-dry', action='store_true',
+                    help='the tool has no --dry-run; skip that assertion')
+    ap.add_argument('--once', action='store_true',
+                    help='skip the second-run assertion')
+    args = ap.parse_args()
+
+    cmd = [a for a in args.command if a != '--']
+    if not cmd:
+        print('Give a command: bin/prove bin/update --from <url>', file=sys.stderr)
+        return 1
+
+    root = os.path.abspath(args.root)
+    cwd = os.path.dirname(root) if os.path.basename(root) == 'brain' else root
+    if not os.path.isabs(cmd[0]):
+        candidate = os.path.join(root, cmd[0].replace('brain/', '', 1))
+        if os.path.isfile(candidate):
+            cmd[0] = candidate
+
+    failures = []
+    print(f'Proving: {" ".join(cmd)}')
+    print(f'Watching: {root}')
+    print()
+
+    a = snap(root)
+    print(f'  {len(a)} file(s) before.')
+    print()
+
+    # 1. A dry run must write nothing. This is the assertion that would have
+    #    caught the worst defect of the four rounds: the cautious path, the one
+    #    an operator uses precisely to inspect a tool before trusting it, was
+    #    the destructive one.
+    if not args.no_dry:
+        code1, out1 = invoke(cmd, cwd, ['--dry-run'])
+        b = snap(root)
+        added, removed, changed = delta(a, b)
+        n = len(added) + len(removed) + len(changed)
+        if rejected_flag(code1, out1) or not advertises_dry_run(cmd, cwd):
+            print('  [skip] this tool has no --dry-run, so there is nothing to')
+            print('         assert about one. It is not claiming anything false.')
+            if n:
+                print(f'         It wrote {n} file(s) while refusing the flag, '
+                      'which is worth knowing.')
+                show('wrote', added, removed, changed)
+        elif code1 != 0 and not n:
+            # A command that failed and wrote nothing has not demonstrated a
+            # working dry run; reporting [ok] here is the vacuous pass.
+            print(f'  [FAIL] --dry-run exited {code1} without writing anything')
+            print('         Nothing ran, so nothing was proved.')
+            for line in out1.strip().split('\n')[-3:]:
+                print(f'         {line}')
+            failures.append('the dry run did not execute, so it proves nothing')
+        elif n:
+            print('  [FAIL] --dry-run wrote to the filesystem')
+            show('wrote', added, removed, changed)
+            failures.append('a dry run that writes is not a dry run')
+        else:
+            print('  [ ok ] --dry-run changed nothing')
+        print()
+        a = snap(root)
+
+    # 2. The real run. Nothing is asserted here — the change set is printed
+    #    beside the output so a person can read one against the other. This is
+    #    the only step that asks for judgement, and it is the step that caught
+    #    a log.md going from 12,339 bytes to 97 with nothing said about it.
+    code2, out2 = invoke(cmd, cwd)
+    c = snap(root)
+    added, removed, changed = delta(a, c)
+    print('  The run said:')
+    for line in (out2.strip() or '(nothing)').split('\n'):
+        print(f'      {line}')
+    print()
+    print('  The run did:')
+    total = show('changed', added, removed, changed)
+    print()
+    print('  Read one against the other. Every file above should be one the')
+    print('  output accounts for, and every claim the output makes should show')
+    print('  up above. A file nobody mentioned is the finding.')
+    print()
+
+    # 3. Run it again. A second identical run should change nothing and should
+    #    have less to say. Two runs that behave differently mean the tool is
+    #    not reporting its own state; two runs that report identically while
+    #    changing nothing mean the count is decorative.
+    if not args.once:
+        code3, out3 = invoke(cmd, cwd)
+        d = snap(root)
+        added2, removed2, changed2 = delta(c, d)
+        churn = [r for r in added2 + removed2 + changed2 if not named_in(out3, r)]
+        announced = [r for r in changed2 if named_in(out3, r)]
+        n2 = len(churn)
+        if announced:
+            print(f'  [ ok ] {len(announced)} announced derived file(s) rewritten: '
+                  + ', '.join(announced[:3]))
+        if n2:
+            print('  [FAIL] a second identical run changed files it never mentioned')
+            show('changed again', [r for r in added2 if r in churn],
+                 [r for r in removed2 if r in churn],
+                 [r for r in changed2 if r in churn])
+            failures.append('not idempotent: running it twice is not running it once')
+        else:
+            print('  [ ok ] a second run changed nothing')
+
+        # The defect is a run that *claims* work over a filesystem that shows
+        # none. Two identical no-op runs both saying "already current" is the
+        # correct behaviour, and flagging that was this tool's own first false
+        # positive.
+        claims = re.search(r'(\d+)\s+path\(s\) updated', out3)
+        if claims and int(claims.group(1)) and not n2:
+            print(f'  [FAIL] it reported {claims.group(1)} path(s) updated and '
+                  'changed nothing')
+            print('         A count that cannot reach zero is not a measurement.')
+            failures.append('the report claims work the filesystem does not show')
+        elif out3.strip() != out2.strip():
+            print('  [ ok ] and had less to say than the first')
+        else:
+            print('  [ ok ] and repeated itself over a no-op, which is honest')
+        print()
+
+    if failures:
+        print(f'  {len(failures)} assertion(s) failed:')
+        for f in failures:
+            print(f'    · {f}')
+        print()
+        print('  This proves the tool is dishonest about what it did. It cannot')
+        print('  prove the opposite — read the change set above for that.')
+        return 1
+
+    print('  Output and filesystem agree.')
+    print()
+    print('  This says the tool reported honestly. It does not say the tool was')
+    print('  right: no assertion here knows which plan a handoff should name or')
+    print('  whether a page reads well. That needs a person who is not you.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

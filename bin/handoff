@@ -1,0 +1,796 @@
+#!/usr/bin/env python3
+"""Render a self-contained HTML handoff for one initiative and one discipline.
+
+Usage:
+    brain/bin/handoff subcontractors --for engineering
+    brain/bin/handoff subcontractors --for design --check
+    brain/bin/handoff --list
+
+Exit 1 only when the brain is in no state to produce an honest handoff.
+
+## Two halves, two files
+
+**The generated half** comes from the graph — the goal, the decisions that
+constrain the work and why, what is deliberately out of scope, task status,
+what is still open. Rewritten on every run and never hand-edited.
+
+**The authored half** lives in `plans/<initiative>/handoff/<discipline>.md`
+beside its images and prototypes, and the generator never touches it. It
+carries what no graph will ever produce: the screenshots, the walkthrough, the
+traps that cost somebody a day.
+
+Composed at render, never merged into one file. A generator that edits around
+human prose eventually eats some of it.
+
+## Why straight to HTML
+
+An intermediate markdown copy is exactly what drifted in the first brain that
+tried this: `handoff.md` and `handoff.html` were hand-maintained in parallel
+and the HTML quietly became the richer of the two, which inverts the whole
+premise of a generated artifact.
+
+## Why it is never required
+
+The check below runs when somebody *asks* for a handoff. Nothing anywhere
+checks that a handoff exists: a solo operator taking something end to end does
+not need one, and plenty of work is too small to warrant one. This makes an
+honest handoff when asked; it does not make handoffs a stage of the process.
+"""
+import argparse
+import html
+import os
+import re
+import sys
+from datetime import date
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+PLANS = os.path.join(ROOT, 'plans')
+TASKS = os.path.join(ROOT, 'tasks')
+
+# Disciplines, not people. The enum shapes the sections; `handed_to` in the
+# evidence node names whoever actually received it, which is where "legal" and
+# every other case the enum will never cover belongs.
+BLOCKS = {
+    'engineering': ['intent', 'orientation', 'constraints', 'open', 'walkthrough',
+                    'traps', 'verified', 'outstanding', 'local', 'excluded'],
+    'design':      ['intent', 'constraints', 'open', 'walkthrough', 'excluded'],
+    'product':     ['intent', 'dates', 'constraints', 'open', 'walkthrough',
+                    'verified', 'outstanding', 'excluded'],
+    'business':    ['intent', 'dates', 'walkthrough', 'outstanding', 'excluded'],
+    'executive':   ['intent', 'dates', 'walkthrough', 'excluded'],
+    'marketing':   ['intent', 'dates', 'walkthrough', 'excluded'],
+    'analysis':    ['intent', 'orientation', 'constraints', 'traps', 'verified',
+                    'local', 'excluded'],
+}
+
+TITLES = {
+    'intent':      'In short',
+    'orientation': 'The first hour',
+    'constraints': 'The decisions that bind this',
+    'open':        "What is deliberately still open",
+    'walkthrough': 'Walkthrough',
+    'traps':       'Traps that cost us time',
+    'verified':    'Verified, and not',
+    'outstanding': 'Outstanding work',
+    'local':       'Running it yourself',
+    'excluded':    'Not included',
+    'dates':       'Dates that matter',
+}
+
+# Frontmatter keys that hold a date the plan is asserting. Deliberately a
+# shape rather than a list: a brain models the dates its work turns on
+# (`consent_by`, `production_date`, `launch_on`), and no enum written here
+# would know their names.
+#
+# INIT.md used to send such a value to the authored half, which meant
+# hand-copying a date out of frontmatter into prose generated from the same
+# plan — a second copy of a value that already exists, which is the drift the
+# authored-half split was built to prevent. the product team wrote the section referring to
+# "the consent date" the way a person naturally does, and the value lived only
+# in `consent_by:` where nothing read it. So the generator reads it instead.
+# Declared for bin/unread, which otherwise cannot see this: the fields below
+# are read by *shape*, not by name, so no textual search for `consent_by` finds
+# the code that renders it. A field matched here is read.
+# reads-frontmatter: *_by=date, *_on=date, *_at=date, *_date=date, deadline=date
+DATE_KEY = re.compile(r'(?:_by|_on|_at|_date|deadline)$', re.I)
+DATE_VALUE = re.compile(r'^\d{4}-\d{2}-\d{2}')
+NOT_A_DATE = {'timestamp', 'superseded_by', 'blocked_by', 'amended_by',
+              'claimed_by', 'handed_to', 'created_at', 'updated_at'}
+
+# Blocks the graph cannot produce. Absent from the authored half, they are
+# simply omitted — an empty "Traps" heading is worse than no heading.
+AUTHORED_ONLY = {'orientation', 'walkthrough', 'traps', 'verified', 'local'}
+
+# Disciplines reading from outside the project. Graph-derived prose was written
+# for colleagues and leaks the vocabulary to prove it: a real exclusion list
+# pulled from task `Out of scope` sections offered an executive "the production
+# flip; that follows the consent date per the rules of engagement". True, and
+# meaningless to the reader. The authored half overrides any block, so the fix
+# is to say so rather than to guess at a rewrite.
+OUTWARD = {'executive', 'business', 'marketing'}
+
+DONE = {'Complete', 'Delivered'}
+
+
+# ---------------------------------------------------------------- frontmatter
+
+def frontmatter(text):
+    if not text.startswith('---'):
+        return {}, text
+    end = text.find('\n---', 3)
+    if end == -1:
+        return {}, text
+    out, key = {}, None
+    for line in text[3:end].split('\n'):
+        if re.match(r'^\s+-\s', line) and key:
+            out.setdefault(key, [])
+            if isinstance(out[key], list):
+                out[key].append(line.strip()[2:].strip().strip('"\''))
+            continue
+        if ':' not in line or line.startswith(' '):
+            continue
+        k, v = line.split(':', 1)
+        key, v = k.strip(), v.strip()
+        if v.startswith('[') and v.endswith(']'):
+            out[key] = [x.strip().strip('"\'') for x in v[1:-1].split(',') if x.strip()]
+        elif v == '':
+        # A key with no inline value opens a block sequence. Setting it to ''
+        # here made the `- item` lines below fall through `isinstance(..., list)`
+        # and vanish — so `constrains:` written the way most people write it
+        # governed nothing, past a green lint, silently switching off the
+        # payoff the README is built around.
+            out[key] = []
+        else:
+            out[key] = v.strip('"\'')
+    return out, text[end + 4:]
+
+
+def read(path):
+    try:
+        return open(path, encoding='utf-8').read()
+    except OSError:
+        return None
+
+
+def section(body, heading):
+    """One `# Heading` section of a markdown body, without its heading."""
+    m = re.search(rf'^#+\s*{re.escape(heading)}\s*$', body, re.M | re.I)
+    if not m:
+        return ''
+    rest = body[m.end():]
+    nxt = re.search(r'^#\s', rest, re.M)
+    return (rest[:nxt.start()] if nxt else rest).strip()
+
+
+def headings(body):
+    """Every `# Heading` in the authored half, in the order written."""
+    return [m.group(1).strip()
+            for m in re.finditer(r'^#+\s*(.+?)\s*$', body, re.M)]
+
+
+def extra_sections(abody, discipline):
+    """Authored sections this discipline's block list has no slot for.
+
+    Returns (heading, html) pairs. A heading whose text matches a TITLE the
+    discipline *does* carry is already placed; one matching a TITLE it does
+    not carry is deliberate authored content for a reader the enum did not
+    anticipate, and belongs on the page just as much.
+    """
+    placed = {TITLES[k].lower() for k in BLOCKS[discipline]}
+    placed.add('appendix')
+    out = []
+    for h in headings(abody):
+        if h.lower() in placed:
+            continue
+        chunk = section(abody, h)
+        if chunk:
+            out.append((h, markdown(chunk)))
+    return out
+
+
+# ------------------------------------------------------------------- markdown
+
+INLINE = [
+    (re.compile(r'!\[([^\]]*)\]\(([^)\s]+)\)'), r'<img src="\2" alt="\1">'),
+    (re.compile(r'\[([^\]]+)\]\(([^)\s]+)\)'), r'<a href="\2">\1</a>'),
+    (re.compile(r'\*\*([^*]+)\*\*'), r'<strong>\1</strong>'),
+    (re.compile(r'(?<![*\w])\*([^*\n]+)\*(?!\*)'), r'<em>\1</em>'),
+]
+
+
+def inline(text):
+    """Escape first, then re-introduce the markup we recognise.
+
+    A built-in renderer rather than a CDN script, so the page opens from a
+    thumb drive on a plane. The subset is what a handoff actually uses.
+    """
+    out = html.escape(text, quote=False)
+    codes = []
+
+    def stash(m):
+        codes.append(m.group(1))
+        return f'\x00{len(codes) - 1}\x00'
+
+    out = re.sub(r'`([^`]+)`', stash, out)
+    for pat, repl in INLINE:
+        out = pat.sub(repl, out)
+    return re.sub(r'\x00(\d+)\x00', lambda m: f'<code>{codes[int(m.group(1))]}</code>', out)
+
+
+def markdown(src):
+    """Headings, paragraphs, lists, tables, quotes, fences, rules, images."""
+    out, lines, i = [], src.split('\n'), 0
+    while i < len(lines):
+        line = lines[i]
+
+        if line.strip().startswith('```'):
+            i += 1
+            buf = []
+            while i < len(lines) and not lines[i].strip().startswith('```'):
+                buf.append(html.escape(lines[i]))
+                i += 1
+            out.append('<pre><code>' + '\n'.join(buf) + '</code></pre>')
+            i += 1
+            continue
+
+        if re.match(r'^\s*(---|\*\*\*)\s*$', line):
+            out.append('<hr>')
+            i += 1
+            continue
+
+        m = re.match(r'^(#{1,6})\s+(.*)$', line)
+        if m:
+            lvl = min(len(m.group(1)) + 1, 6)
+            out.append(f'<h{lvl}>{inline(m.group(2).strip())}</h{lvl}>')
+            i += 1
+            continue
+
+        if line.lstrip().startswith('|') and i + 1 < len(lines) \
+           and set(lines[i + 1].strip()) <= set('|-: '):
+            def row(l, tag):
+                cells = [c.strip() for c in l.strip().strip('|').split('|')]
+                return '<tr>' + ''.join(f'<{tag}>{inline(c)}</{tag}>' for c in cells) + '</tr>'
+            head = row(lines[i], 'th')
+            i += 2
+            body = []
+            while i < len(lines) and lines[i].lstrip().startswith('|'):
+                body.append(row(lines[i], 'td'))
+                i += 1
+            out.append(f'<table><thead>{head}</thead><tbody>{"".join(body)}</tbody></table>')
+            continue
+
+        if re.match(r'^\s*[-*+]\s+|^\s*\d+[.)]\s+', line):
+            ordered = bool(re.match(r'^\s*\d+[.)]\s+', line))
+            items = []
+            while i < len(lines) and re.match(r'^\s*([-*+]|\d+[.)])\s+', lines[i]):
+                items.append(inline(re.sub(r'^\s*([-*+]|\d+[.)])\s+', '', lines[i])))
+                i += 1
+            tag = 'ol' if ordered else 'ul'
+            out.append(f'<{tag}>' + ''.join(f'<li>{t}</li>' for t in items) + f'</{tag}>')
+            continue
+
+        if line.lstrip().startswith('>'):
+            buf = []
+            while i < len(lines) and lines[i].lstrip().startswith('>'):
+                buf.append(lines[i].lstrip()[1:].strip())
+                i += 1
+            out.append(f'<blockquote>{inline(" ".join(buf))}</blockquote>')
+            continue
+
+        if line.strip():
+            # The break pattern must require whitespace after a list marker,
+            # exactly as the list branch above does. Without it a paragraph
+            # opening with `**bold**` matched `*`, the loop consumed nothing,
+            # `i` never advanced, and the renderer hung — which is the only
+            # unacceptable failure mode for a tool that runs unattended.
+            BREAK = r'^\s*([-*+]\s|\d+[.)]\s|#|>|\||```)'
+            buf = []
+            while i < len(lines) and lines[i].strip() \
+                  and not re.match(BREAK, lines[i]):
+                buf.append(lines[i].strip())
+                i += 1
+            if not buf:                 # belt and braces: never stall
+                buf = [lines[i].strip()]
+                i += 1
+            out.append(f'<p>{inline(" ".join(buf))}</p>')
+            continue
+
+        i += 1
+
+    return '\n'.join(out)
+
+
+# ------------------------------------------------------------- read the graph
+
+def inbound(candidates, initiative):
+    """How many other documents in this initiative link to each candidate.
+
+    Real structure rather than a convention: the initiative's plan is the one
+    its sibling plans and the folder index cite, and it does not cite them.
+    """
+    counts = {c: 0 for c, _ in candidates}
+    paths = [os.path.join(PLANS, initiative), os.path.join(TASKS, initiative)]
+    for folder in paths:
+        if not os.path.isdir(folder):
+            continue
+        for base, dirs, files in os.walk(folder):
+            for f in files:
+                if not f.endswith('.md'):
+                    continue
+                src = os.path.join(base, f)
+                text = read(src) or ''
+                for cand in counts:
+                    if os.path.realpath(src) == os.path.realpath(cand):
+                        continue
+                    if os.path.basename(cand) in text:
+                        counts[cand] += 1
+    return counts
+
+
+def plan_for(initiative, explicit=None):
+    """The plan a handoff for this initiative is about.
+
+    Picked wrong three times, each time by inferring from a convention that
+    turned out to vary:
+
+      * the last match in sorted-walk order — the highest id, so the newest
+        sub-feature. A real executive page was titled after a sub-feature
+        added four days earlier.
+      * the lowest id. Ids are allocated at migration in whatever order the
+        importer walked, and D0003 makes them permanent, so which plan holds
+        the lowest id is an accident that cannot be corrected.
+      * the only plan carrying `serves:`. `bin/lint` *requires* `serves:` on
+        every Approach node, so in a linted brain all 19 of them had it and
+        the key discriminated nothing. A field cannot be both mandatory and a
+        discriminator.
+
+    So it no longer infers from a convention. In order: an explicit `--plan`,
+    then `initiative_plan: true` in frontmatter, then inbound links, then the
+    lowest id — and it always says which it used, because the caller is the
+    only one who can tell it is wrong.
+    """
+    if explicit:
+        path = explicit if os.path.isabs(explicit) else os.path.join(ROOT, explicit)
+        if not os.path.isfile(path):
+            return None, ''
+        # It accepted any path at all, including a task, and then read a task's
+        # frontmatter as a plan's — producing a handoff built from the wrong
+        # kind of node with nothing said about it.
+        meta, _ = frontmatter(read(path) or '')
+        if meta.get('type') != 'plan':
+            kind = meta.get('type') or 'untyped'
+            return None, f'--plan names a `{kind}`, not a plan: {explicit}'
+        # A plan of the wrong initiative would be read against this
+        # initiative's tasks, pairing one initiative's intent with another's
+        # work and saying nothing about it.
+        if meta.get('initiative') and meta['initiative'] != initiative:
+            return None, (f'--plan belongs to `{meta["initiative"]}`, not '
+                          f'`{initiative}`: {explicit}')
+        return path, 'named with --plan'
+
+    direct = os.path.join(PLANS, initiative, 'plan.md')
+    if os.path.isfile(direct):
+        return direct, 'the initiative\'s plan.md'
+
+    found = []
+    for base, dirs, files in os.walk(PLANS):
+        for f in sorted(files):
+            if not f.endswith('.md') or f == 'index.md':
+                continue
+            meta, _ = frontmatter(read(os.path.join(base, f)) or '')
+            if meta.get('type') == 'plan' and meta.get('initiative') == initiative:
+                found.append((os.path.join(base, f), meta))
+
+    if not found:
+        return None, ''
+    if len(found) == 1:
+        return found[0][0], 'the only plan in this initiative'
+
+    marked = [c for c, m in found
+              if str(m.get('initiative_plan', '')).lower() in ('true', 'yes')]
+    if len(marked) == 1:
+        return marked[0], '`initiative_plan: true`'
+    if len(marked) > 1:
+        return (sorted(marked)[0],
+                f'WARNING: {len(marked)} plans claim `initiative_plan: true`')
+
+    counts = inbound(found, initiative)
+    top = max(counts.values())
+    if top:
+        winners = sorted(c for c, n in counts.items() if n == top)
+        if len(winners) == 1:
+            return winners[0], f'cited by {top} sibling document(s)'
+
+    return (sorted(c for c, _ in found)[0],
+            f'lowest id of {len(found)} plans — a guess; set '
+            '`initiative_plan: true` on the right one')
+
+
+def tasks_for(initiative):
+    folder = os.path.join(TASKS, initiative)
+    out = []
+    if not os.path.isdir(folder):
+        return out
+    for f in sorted(os.listdir(folder)):
+        if not re.match(r'^T\d{4}-.*\.md$', f):
+            continue
+        meta, body = frontmatter(read(os.path.join(folder, f)) or '')
+        if meta.get('type') == 'task':
+            meta['_body'] = body
+            out.append(meta)
+    return out
+
+
+def resolve(origin, href):
+    return os.path.normpath(os.path.join(os.path.dirname(origin), href))
+
+
+def decisions_binding(plan_path, plan_body, tasks):
+    """Decisions this initiative actually carries out.
+
+    Links from the plan and from the task bodies, which is where `/to-tasks`
+    is told to cite the decision a ticket carries out. Not every decision in
+    the catalog — a handoff that lists all of them lists none of them.
+    """
+    found, seen = [], set()
+    sources = [(plan_path, plan_body)] + [
+        (os.path.join(TASKS, t.get('initiative', ''), 'x'), t['_body']) for t in tasks]
+
+    for origin, body in sources:
+        for href in re.findall(r'\]\(([^)\s]+\.md)\)', body or ''):
+            path = resolve(origin, href)
+            if '/decisions/' not in path.replace(os.sep, '/') or path in seen:
+                continue
+            seen.add(path)
+            meta, dbody = frontmatter(read(path) or '')
+            if meta.get('type') not in ('decision', 'principle'):
+                continue
+            found.append({
+                'id': meta.get('id', ''),
+                'title': meta.get('title', os.path.basename(path)),
+                'invariant': meta.get('invariant', ''),
+                'status': meta.get('status', ''),
+                'why': section(dbody, 'Decision') or section(dbody, 'Principle'),
+            })
+    return sorted(found, key=lambda d: d['id'])
+
+
+def goal_of(plan_meta, plan_path):
+    serves = plan_meta.get('serves')
+    if not serves:
+        return None
+    path = resolve(plan_path, serves if isinstance(serves, str) else serves[0])
+    meta, body = frontmatter(read(path) or '')
+    if not meta:
+        return None
+    return {'id': meta.get('id', ''), 'title': meta.get('title', ''),
+            'why': section(body, 'Why')}
+
+
+def out_of_scope(tasks, plan_body):
+    items = []
+    for t in tasks:
+        for line in section(t['_body'], 'Out of scope').split('\n'):
+            line = line.strip().lstrip('-* ').strip()
+            if len(line) > 8 and line.lower() != 'anything not named in the acceptance criteria above':
+                items.append(line)
+    items += [l.strip().lstrip('-* ').strip()
+              for l in section(plan_body, 'Out of scope').split('\n') if len(l.strip()) > 8]
+    return list(dict.fromkeys(items))
+
+
+# -------------------------------------------------------------- the state gate
+
+def inspect(initiative, explicit=None):
+    """Can an honest handoff be made? Hard failures block; the rest is reported.
+
+    Deliberately permissive about outstanding work: a design handoff happens
+    *before* the work, so everything being outstanding is the normal case and
+    must never be an error.
+    """
+    blocking, notes = [], []
+
+    plan_path, why = plan_for(initiative, explicit)
+    if not plan_path and why:
+        blocking.append(why)
+        return None, blocking, notes
+    if not plan_path:
+        blocking.append(f'no plan for `{initiative}` — a handoff with no plan behind it '
+                        f'is a document with no source')
+        return None, blocking, notes
+
+    notes.append(f'plan: {os.path.relpath(plan_path, ROOT)} ({why})')
+    plan_meta, plan_body = frontmatter(read(plan_path))
+    tasks = tasks_for(initiative)
+
+    if not plan_meta.get('serves'):
+        blocking.append(f'{os.path.relpath(plan_path, ROOT)} has no `serves:` — the lineage '
+                        f'does not reach a goal, so there is no stated intent for this '
+                        f'handoff to be checked against')
+
+    drafts = [d for d in decisions_binding(plan_path, plan_body, tasks)
+              if d['status'] == 'draft']
+    if drafts:
+        notes.append(f'{len(drafts)} decision(s) still `draft`: '
+                     + ', '.join(d['id'] for d in drafts)
+                     + ' — they will be shown as constraints anyway')
+
+    open_tasks = [t for t in tasks if t.get('status') not in DONE]
+    if open_tasks:
+        notes.append(f'{len(open_tasks)} of {len(tasks)} task(s) not complete — normal '
+                     f'before the work, worth saying out loud after it')
+    if not tasks:
+        notes.append('no tasks in this initiative yet')
+
+    return {'plan_path': plan_path, 'plan_meta': plan_meta, 'plan_body': plan_body,
+            'tasks': tasks}, blocking, notes
+
+
+# ---------------------------------------------------------------- compose
+
+def build_blocks(ctx, initiative, discipline, authored_dir, authored_keys=None):
+    plan_meta, plan_body, plan_path = ctx['plan_meta'], ctx['plan_body'], ctx['plan_path']
+    tasks = ctx['tasks']
+    out = {}
+
+    # The forwardable half-page the plan carries. It is the first handoff:
+    # written at plan time for whoever approves the work, and reused verbatim
+    # here so the two can never drift apart.
+    intent = section(plan_body, 'Intent (forwardable)') or section(plan_body, 'Intent')
+    goal = goal_of(plan_meta, plan_path)
+    if intent or goal:
+        parts = []
+        if intent:
+            parts.append(intent)
+        elif goal and goal['why']:
+            parts.append(goal['why'])
+        if goal:
+            # No html.escape here: this string goes through markdown(), and
+            # inline() escapes. Escaping twice rendered an apostrophe as
+            # `&#x27;` on the page.
+            parts.append(f"\nThis serves **{goal['title']}**.")
+        out['intent'] = markdown('\n\n'.join(parts))
+
+    binding = decisions_binding(plan_path, plan_body, tasks)
+    if binding:
+        rows = []
+        for d in binding:
+            claim = d['invariant'] or ' '.join(d['why'].split())[:220]
+            flag = ' <span class="chip">draft</span>' if d['status'] == 'draft' else ''
+            rows.append(f'<div class="constraint"><div class="cid">{html.escape(d["id"])}'
+                        f'{flag}</div><div><strong>{inline(d["title"])}</strong>'
+                        f'<p>{inline(claim)}</p></div></div>')
+        out['constraints'] = ''.join(rows)
+
+    open_items = [t for t in tasks if t.get('status') == 'Not Ready']
+    if open_items:
+        out['open'] = markdown('\n'.join(
+            f"- **{t.get('title','')}** — {t.get('imported_status') or t.get('description','')}"
+            for t in open_items))
+
+    pending = [t for t in tasks if t.get('status') not in DONE]
+    if pending:
+        tiers = {'In Progress': [], 'Testing': [], 'Ready for Development': [], 'Not Ready': []}
+        for t in pending:
+            tiers.setdefault(t.get('status', 'Not Ready'), []).append(t)
+        chunks = []
+        for name, group in tiers.items():
+            if not group:
+                continue
+            chunks.append(f'**{name}**\n\n' + '\n'.join(
+                f"- {t.get('title','')}" for t in group))
+        out['outstanding'] = markdown('\n\n'.join(chunks))
+
+    dated = [(k.replace('_', ' ').capitalize(), v)
+             for k, v in sorted(ctx['plan_meta'].items())
+             if k not in NOT_A_DATE and DATE_KEY.search(k)
+             and isinstance(v, str) and DATE_VALUE.match(v.strip())]
+    if dated:
+        out['dates'] = markdown(
+            '\n'.join(f'- **{label}** — {value}' for label, value in dated))
+
+    excluded = out_of_scope(tasks, plan_body)
+    if excluded:
+        out['excluded'] = markdown('\n'.join(f'- {e}' for e in excluded))
+
+    # The authored half: never generated, never rewritten.
+    authored = read(os.path.join(authored_dir, f'{discipline}.md'))
+    if authored:
+        # The authored half sits in `handoff/` and names its screenshots
+        # relative to itself; the page is written one directory above. Every
+        # image in a generated page 404'd — eleven of them, against a
+        # hand-written page where all eleven worked.
+        authored = re.sub(r'(!\[[^\]]*\]\()(?!https?:|/|handoff/)',
+                          r'\1handoff/', authored)
+        _, abody = frontmatter(authored)
+        for key in BLOCKS[discipline]:
+            chunk = section(abody, TITLES[key])
+            if chunk:
+                out[key] = markdown(chunk)
+                if authored_keys is not None:
+                    authored_keys.add(key)
+        extra = section(abody, 'Appendix')
+        if extra:
+            out['appendix'] = markdown(extra)
+
+        # Anything else the author wrote. A heading reached the page only if it
+        # matched one of ten TITLES *and* that key was in this discipline's
+        # list; everything else was dropped without a word. Measured on a real
+        # executive handoff: five of eight authored sections never arrived,
+        # including the one carrying the date the whole agreement turned on.
+        #
+        # Silently discarding prose a person wrote for a named reader is the
+        # worst way to be wrong here — the author has no symptom to notice. So
+        # unmatched sections render in the order they were written, after the
+        # generated ones, and the run says which.
+        out['_extra'] = extra_sections(abody, discipline)
+
+    return out
+
+
+CSS = """
+:root{--paper:#FBFBF9;--sheet:#fff;--ink:#1B2431;--soft:#4C5666;--muted:#7A8390;
+--rule:#DDE2E8;--accent:#0E6F6B;--tint:#E8F3F2;--chip:#FFF4DB;--chipink:#8A5A00;
+--serif:"Iowan Old Style",Georgia,serif;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+--mono:ui-monospace,Menlo,monospace}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--paper:#111820;--sheet:#182029;
+--ink:#E8ECF1;--soft:#B8C0CB;--muted:#7F8A97;--rule:#2A3441;--accent:#5BC2BC;--tint:#1C2F2E;
+--chip:#3A2E12;--chipink:#F2C25B}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.65 var(--sans);
+-webkit-font-smoothing:antialiased}
+.wrap{max-width:46rem;margin:0 auto;padding:4rem 1.5rem 6rem}
+header{border-bottom:2px solid var(--ink);padding-bottom:1.5rem;margin-bottom:2.5rem}
+.eyebrow{font:500 11px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;
+color:var(--accent);margin:0 0 .9rem}
+h1{font:400 2.6rem/1.1 var(--serif);margin:0 0 .6rem;letter-spacing:-.01em}
+.sub{color:var(--muted);font-size:.9rem;margin:0}
+section{margin:0 0 3rem}
+h2{font:400 1.5rem/1.25 var(--serif);margin:0 0 1rem;padding-bottom:.4rem;
+border-bottom:1px solid var(--rule)}
+h3{font:600 .95rem/1.4 var(--sans);margin:1.8rem 0 .5rem}
+p{margin:0 0 1rem;color:var(--soft)}
+strong{color:var(--ink)}
+ul,ol{margin:0 0 1rem;padding-left:1.2rem;color:var(--soft)}
+li{margin:.3rem 0}
+blockquote{margin:1.2rem 0;padding:.8rem 1.1rem;background:var(--tint);
+border-left:3px solid var(--accent);border-radius:0 4px 4px 0}
+blockquote p{margin:0;color:var(--ink)}
+code{font:.85em var(--mono);background:var(--tint);padding:.12em .35em;border-radius:3px}
+pre{background:var(--sheet);border:1px solid var(--rule);border-radius:6px;padding:1rem;
+overflow-x:auto}
+pre code{background:none;padding:0}
+img{max-width:100%;border:1px solid var(--rule);border-radius:6px;display:block;margin:1.2rem 0}
+table{width:100%;border-collapse:collapse;margin:1.2rem 0;font-size:.9rem}
+th,td{text-align:left;padding:.5rem .7rem;border-bottom:1px solid var(--rule)}
+th{font:600 .75rem/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+hr{border:0;border-top:1px solid var(--rule);margin:2rem 0}
+.constraint{display:flex;gap:1rem;padding:.9rem 0;border-bottom:1px solid var(--rule)}
+.constraint:last-child{border-bottom:0}
+.cid{font:600 .78rem/1.6 var(--mono);color:var(--accent);min-width:4.2rem}
+.constraint p{margin:.25rem 0 0;font-size:.92rem}
+.chip{display:inline-block;background:var(--chip);color:var(--chipink);font:600 .62rem/1 var(--mono);
+padding:.22em .45em;border-radius:3px;letter-spacing:.05em;text-transform:uppercase;margin-left:.3rem}
+footer{margin-top:4rem;padding-top:1.2rem;border-top:1px solid var(--rule);
+color:var(--muted);font-size:.8rem}
+@media print{body{background:#fff}.wrap{padding:0;max-width:none}
+section{break-inside:avoid}img{break-inside:avoid}}
+"""
+
+
+def render(initiative, discipline, blocks, ctx):
+    # `excluded` is a scope disclaimer. It used to render before the authored
+    # prose, which put "Not included" ahead of "The problem this solves" on an
+    # executive page and buried the only section with a deadline in it at
+    # position six of eight. It is the one generated section with no reason to
+    # come before something a person wrote.
+    order = [k for k in BLOCKS[discipline] if k != 'excluded']
+    parts = [f'<section><h2>{html.escape(TITLES[k])}</h2>{blocks[k]}</section>'
+             for k in order if blocks.get(k)]
+    for heading, chunk in (blocks.get('_extra') or []):
+        parts.append(f'<section><h2>{html.escape(heading)}</h2>{chunk}</section>')
+    if 'excluded' in BLOCKS[discipline] and blocks.get('excluded'):
+        parts.append(f'<section><h2>{html.escape(TITLES["excluded"])}</h2>'
+                     f'{blocks["excluded"]}</section>')
+    if blocks.get('appendix'):
+        parts.append(f'<section><h2>Appendix</h2>{blocks["appendix"]}</section>')
+
+    title = ctx['plan_meta'].get('title') or initiative.replace('-', ' ').title()
+    # A plan is titled "<Thing> plan"; the handoff is about the thing itself.
+    title = re.sub(r'\s+plan$', '', title, flags=re.I)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(title, quote=False)}</title>
+<style>{CSS}</style></head><body><div class="wrap">
+<header>
+<p class="eyebrow">Handoff &middot; {html.escape(discipline)}</p>
+<h1>{html.escape(title, quote=False)}</h1>
+<p class="sub">{html.escape(ctx['plan_meta'].get('description', ''), quote=False)}</p>
+</header>
+{''.join(parts)}
+<footer>Generated {date.today().isoformat()} from the project record.
+The parts that come from the record are rewritten on every build; the
+walkthrough and anything written for a reader are not.</footer>
+</div></body></html>
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Render a handoff for one initiative.')
+    ap.add_argument('initiative', nargs='?')
+    ap.add_argument('--for', dest='discipline', choices=sorted(BLOCKS))
+    ap.add_argument('--plan', help='the plan this handoff is about, when the '
+                                   'initiative holds more than one')
+    ap.add_argument('--check', action='store_true', help='report readiness and stop')
+    ap.add_argument('--list', action='store_true', help='initiatives and disciplines')
+    args = ap.parse_args()
+
+    if args.list or not args.initiative:
+        print('disciplines: ' + ', '.join(sorted(BLOCKS)))
+        print('initiatives:')
+        for d in sorted(os.listdir(TASKS) if os.path.isdir(TASKS) else []):
+            if os.path.isdir(os.path.join(TASKS, d)):
+                print(f'  {d}')
+        return 0
+
+    ctx, blocking, notes = inspect(args.initiative, args.plan)
+
+    for b in blocking:
+        print(f'  BLOCKED  {b}', file=sys.stderr)
+    for n in notes:
+        print(f'  note     {n}')
+    if blocking:
+        print('\n  No handoff written. Nothing requires one — but one made from this '
+              'would not be honest.', file=sys.stderr)
+        return 1
+    if args.check:
+        print('\n  Ready to generate.')
+        return 0
+    if not args.discipline:
+        print('  Give --for <discipline>: ' + ', '.join(sorted(BLOCKS)), file=sys.stderr)
+        return 1
+
+    authored_dir = os.path.join(os.path.dirname(ctx['plan_path']), 'handoff')
+    authored_keys = set()
+    blocks = build_blocks(ctx, args.initiative, args.discipline, authored_dir, authored_keys)
+
+    missing = [k for k in BLOCKS[args.discipline]
+               if k in AUTHORED_ONLY and not blocks.get(k)]
+    if missing:
+        src = os.path.join(authored_dir, f'{args.discipline}.md')
+        rel = os.path.relpath(src, ROOT)
+        where = (f'{rel} does not carry' if os.path.isfile(src)
+                 else f'no authored half at {rel}, so nothing carries')
+        print(f'  note     {where}: ' + ', '.join(TITLES[k] for k in missing))
+        print('           omitted rather than left empty. The graph cannot write those '
+              '— a screenshot\n           walkthrough, or a trap that cost somebody a '
+              'day, has to come from a person.')
+
+    if blocks.get('_extra'):
+        print('  note     carried through verbatim, outside this discipline\'s '
+              'sections: '
+              + ', '.join(h for h, _ in blocks['_extra']))
+        print('           They render after the generated ones, in the order you '
+              'wrote them.')
+
+    if args.discipline in OUTWARD:
+        derived = [k for k in BLOCKS[args.discipline]
+                   if k in ('excluded', 'open', 'outstanding')
+                   and blocks.get(k) and k not in authored_keys]
+        if derived:
+            print('  note     ' + ', '.join(TITLES[k] for k in derived)
+                  + ' came from the record, which was written for colleagues.')
+            print('           Read it as a reader outside the project would; rewrite it '
+                  'in the\n           authored half if it carries internal vocabulary.')
+
+    out = os.path.join(os.path.dirname(ctx['plan_path']),
+                       f'handoff-{args.discipline}.html')
+    open(out, 'w', encoding='utf-8').write(render(args.initiative, args.discipline, blocks, ctx))
+    print(f'\n  wrote {os.path.relpath(out, ROOT)}  '
+          f'({len([k for k in BLOCKS[args.discipline] if blocks.get(k)]) + len(blocks.get('_extra') or [])} sections)')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

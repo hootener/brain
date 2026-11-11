@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Check that this brain is installed and wired correctly.
+
+Usage: brain/bin/doctor [--quiet]
+Exit 1 if anything is broken. Exit 0 on warnings alone.
+
+`bin/lint` checks whether the *contents* conform. This checks whether the
+*installation* does — the half that is invisible from inside a markdown file
+and that silently makes the rest useless: skills that were never symlinked, so
+no skill is discoverable; date placeholders nobody stamped, so every node
+claims to be from `<YYYY-MM-DD>`; a config that was never written, so the tools
+are back to guessing.
+
+Split from `lint` because it answers a different question and is worth running
+alone after an install. `lint` calls it, since lint is the gate.
+"""
+import argparse
+import os
+import time
+import re
+import subprocess
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+TOOLS = ['adopt', 'lint', 'doctor', 'index', 'status', 'graph-build', 'relevant',
+         'ancestry', 'stale', 'constraints', 'reconcile', 'new', 'renumber',
+         'relink', 'handoff', 'selftest', 'update', 'utterances', 'diagram']
+
+errors, warnings, notes = [], [], []
+
+
+def config():
+    path = os.path.join(ROOT, 'config.md')
+    if not os.path.isfile(path):
+        errors.append('no `config.md` — run `bin/adopt`, which records whether this '
+                      'brain is embedded or a sibling so the tools stop guessing')
+        return {}
+    out = {}
+    text = open(path, encoding='utf-8').read()
+    m = re.match(r'^---\n(.*?)\n---', text, re.S)
+    for line in (m.group(1).splitlines() if m else []):
+        if ':' in line and not line.startswith(' '):
+            k, v = line.split(':', 1)
+            out[k.strip()] = v.strip().strip('"\'')
+    if out.get('mode') not in ('embedded', 'sibling', 'template'):
+        errors.append(f'config.md `mode` is `{out.get("mode")}` — expected '
+                      f'embedded, sibling or template')
+    return out
+
+
+def check_skills(mode):
+    """Claude Code discovers skills through `.claude/skills`. Without the link
+    the brain is present and entirely unreachable, which looks like nothing
+    being wrong."""
+    if mode == 'template':
+        notes.append('unadopted template — no `.claude/skills` link expected yet')
+        return
+    # Both modes: the brain's parent. Embedded that is the host repo;
+    # sibling it is the workspace holding the brain and the project repos.
+    host = os.path.dirname(ROOT)
+    link = os.path.join(host, '.claude', 'skills')
+    if not os.path.exists(link):
+        errors.append(f'no `.claude/skills` at {os.path.relpath(link, host)} — no skill '
+                      f'is discoverable. `ln -s ../brain/skills .claude/skills`')
+    elif os.path.islink(link) and (time.time() - os.lstat(link).st_mtime) < 600:
+        notes.append('`.claude/skills` was linked in the last few minutes. A Claude '
+                     'Code session\n        already running will not see those skills '
+                     'until it restarts — and it\n        may start seeing them part way '
+                     'through, which is worse, because the\n        lesson never sticks.')
+    elif os.path.islink(link):
+        target = os.path.realpath(link)
+        if target != os.path.join(ROOT, 'skills'):
+            warnings.append(f'`.claude/skills` points at {target}, not this brain')
+    else:
+        warnings.append(
+            '`.claude/skills` is a real directory, not a link into this brain. '
+            'Whatever is in it\n        is what Claude Code loads — this brain\'s '
+            'skills are not. Expected on Windows,\n        where symlinks need a '
+            'privilege; otherwise it usually means an older install\n        is still '
+            'in place. `rm -rf .claude/skills && bin/adopt` relinks it.')
+
+
+def check_placeholders():
+    """An unstamped `<YYYY-MM-DD>` is a node claiming no date at all."""
+    hits = []
+    for base, dirs, files in os.walk(ROOT):
+        dirs[:] = [d for d in dirs if d not in {'.git', 'bin', 'templates', 'example',
+                                                'docs', 'feedback', 'hooks', 'skills'}]
+        for name in files:
+            if not name.endswith('.md'):
+                continue
+            path = os.path.join(base, name)
+            text = open(path, encoding='utf-8').read()
+            # Inside backticks or a fence it is an illustration — a filename
+            # pattern like `plans/<YYYY-MM-DD>-<slug>.md`, or example
+            # frontmatter showing an unfilled field. Flagging those ends every
+            # check dirty, which teaches a reader to skip the last line.
+            bare = re.sub(r'```.*?```', '', text, flags=re.S)
+            bare = re.sub(r'`[^`\n]*`', '', bare)
+            if '<YYYY-MM-DD>' in bare:
+                hits.append(os.path.relpath(path, ROOT))
+    if hits:
+        warnings.append(f'{len(hits)} file(s) still carry a `<YYYY-MM-DD>` placeholder: '
+                        + ', '.join(sorted(hits)[:4]) + ('…' if len(hits) > 4 else ''))
+
+
+def check_tools():
+    for name in TOOLS:
+        path = os.path.join(ROOT, 'bin', name)
+        if not os.path.isfile(path):
+            errors.append(f'bin/{name} is missing')
+        elif not os.access(path, os.X_OK):
+            errors.append(f'bin/{name} is not executable — `chmod +x brain/bin/{name}`')
+
+
+def check_git(mode):
+    inside = subprocess.run(['git', '-C', ROOT, 'rev-parse', '--show-toplevel'],
+                            capture_output=True, text=True)
+    if inside.returncode != 0:
+        warnings.append('not a git repository — the brain is only checkable against '
+                        'history when it is versioned')
+        return
+    top = os.path.realpath(inside.stdout.strip())
+    if mode == 'embedded' and top == os.path.realpath(ROOT):
+        # An error, not a warning. Embedded exists *for* co-versioning (D0004):
+        # a decision and the code it governs moving in one commit is what makes
+        # "this was true at this commit" checkable rather than asserted. With a
+        # `.git` of its own, the host tracks a gitlink it cannot resolve — one
+        # entry instead of every file — so none of that is happening and the
+        # mode's premise is simply false. Measured: 1 tracked entry vs 80.
+        errors.append('the brain has its own `.git` but config says `embedded`. '
+                      'The host repo is tracking a gitlink, not your knowledge — '
+                      'run `rm -rf brain/.git` (the brain is versioned by the host), '
+                      'or set `mode: sibling` in config.md if it really is its own repo')
+
+    if mode == 'embedded':
+        # Embedded-but-gitignored is a real arrangement the docs do not name,
+        # and it was reached deliberately: a public repository whose owner did
+        # not want the brain published. Nothing flagged it, because `doctor`
+        # asks whether the install is sound and it is. But the premise of
+        # embedded is co-versioning — D0004 exists so that "this was true at
+        # this commit" is checkable — and an ignored directory is not
+        # versioned with anything.
+        #
+        # A warning, not an error: the arrangement is defensible, the silence
+        # was not.
+        ignored = subprocess.run(
+            ['git', '-C', top, 'check-ignore', '-q',
+             os.path.relpath(os.path.realpath(ROOT), top)],
+            capture_output=True)
+        if ignored.returncode == 0:
+            warnings.append(
+                'mode is `embedded` but the host repo ignores the brain, so '
+                'nothing is co-versioned — the claim "this was true at this '
+                'commit" is not checkable here. Deliberate for a public repo; '
+                'if so, consider `mode: sibling` and a repo of its own, which '
+                'is the arrangement that gets you history back')
+
+
+def check_example():
+    """Nothing but the template's own record may sit in example/.
+
+    `example/` is skipped by `lint` and `graph-build`, so a node that lands
+    there is invisible to every gate — and it sits in the one directory the
+    README tells you to delete. A second `bin/adopt` once swept four of an
+    operator's decisions in there and every check still reported sound.
+    """
+    dest = os.path.join(ROOT, 'example')
+    if not os.path.isdir(dest):
+        return
+    manifest = os.path.join(dest, '.manifest')
+    if not os.path.isfile(manifest):
+        warnings.append('example/ has no `.manifest` — it predates the one adopt now '
+                        'writes, so nothing can tell the template\'s record from a '
+                        'node that landed there by mistake')
+        return
+
+    listed = {l.strip() for l in open(manifest, encoding='utf-8')
+              if l.strip() and not l.startswith('#')}
+    stray = []
+    for base, dirs, files in os.walk(dest):
+        for f in files:
+            if not f.endswith('.md'):
+                continue
+            rel = os.path.relpath(os.path.join(base, f), dest)
+            if rel not in listed and not any(rel.startswith(l.rstrip('/') + os.sep)
+                                             or l == rel for l in listed):
+                stray.append(rel)
+    if stray:
+        errors.append(f'example/ holds {len(stray)} file(s) the template never put '
+                      f'there — {", ".join(sorted(stray)[:3])}. They are invisible to '
+                      f'lint and the graph, and example/ is the directory you are told '
+                      f'to delete. Move them back into the catalog.')
+
+
+def check_graph():
+    graph = os.path.join(ROOT, 'graph.html')
+    if not os.path.isfile(graph):
+        warnings.append('graph.html has never been built — run `bin/graph-build`')
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Is this brain installed correctly?')
+    ap.add_argument('--quiet', action='store_true')
+    args = ap.parse_args()
+
+    cfg = config()
+    mode = cfg.get('mode', 'template')
+    check_skills(mode)
+    check_placeholders()
+    check_tools()
+    check_git(mode)
+    check_example()
+    check_graph()
+
+    if not args.quiet:
+        print(f'brain at {ROOT}')
+        rev = cfg.get('brain_revision') or 'unrecorded'
+        print(f'  mode: {mode}   upstream: {rev}'
+              + (f"   repos: {cfg.get('repos')}" if cfg.get('repos') else ''))
+        print()
+        for n in notes:
+            print(f'  note  {n}')
+        for w in warnings:
+            print(f'  warn  {w}')
+    for e in errors:
+        print(f'  ERROR {e}', file=sys.stderr)
+
+    if not args.quiet:
+        print(f'\n  {len(errors)} error(s) · {len(warnings)} warning(s)')
+        if not errors and not warnings:
+            print('  Installation is sound.')
+    return 1 if errors else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

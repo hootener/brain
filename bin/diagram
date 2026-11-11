@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Render the lineage diagram: the four categories and the three traversals.
+
+Usage: brain/bin/diagram
+Writes brain/docs/lineage.svg and brain/docs/lineage-dark.svg.
+
+## Why this is generated rather than drawn
+
+The node fills are the *same palette* `bin/graph-build` paints the graph with.
+Drawn by hand they would be a second copy of that palette, and the two would
+drift the first time a type was added — the exact failure this brain exists to
+catch. `PALETTE` below is the one place the colours live; graph-build reads the
+same hexes and a mismatch is a lint finding, not a cosmetic difference.
+
+Two files because GitHub renders a README's SVG as an image, so `currentColor`
+never resolves and a single file is unreadable in one theme or the other. The
+README pairs them with `<picture>`.
+"""
+import os
+
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'docs')
+
+# Must match bin/graph-build's TYPE_FILL. `evidence` carries what was `context`.
+PALETTE = {
+    'goal':     '#a5d6a7',
+    'decision': '#b39ddb',
+    'plan':     '#f5bd8f',
+    'spec':     '#9ecbe8',
+    'task':     '#aebdd4',
+    'evidence': '#9fd8cf',
+}
+
+THEMES = {
+    'lineage.svg':      dict(box='#9a9aa3', boxlabel='#6b6b73', nodelabel='#4a4a52',
+                             rail='#121212', edge='#9a9aa3'),
+    'lineage-dark.svg': dict(box='#6e7681', boxlabel='#9ba3af', nodelabel='#adb6c2',
+                             rail='#e6e8eb', edge='#6e7681'),
+}
+NODE_STROKE = '#2a2a2e'   # dark ring on a light fill: reads in both themes
+R = 18
+MONO = 'ui-monospace,Menlo,monospace'
+
+# Dashed category boxes: (label, x, width, label centre x)
+BOXES = [
+    ('INTENT',   40,  200, 140),
+    ('APPROACH', 330, 370, 515),
+    ('ACTION',   740, 160, 820),
+    ('EVIDENCE', 940, 200, 1040),
+]
+BOX_Y, BOX_H = 40, 300
+
+# (type, cx, cy) — every label sits centred beneath its circle. Labelling the
+# tasks to the *right* put the four `task` strings directly on the lines leaving
+# them for Evidence, which struck the text through. Below the circle, an edge
+# departing the right edge at x = cx + r clears the label entirely.
+NODES = [
+    ('goal',      80, 130),
+    ('decision',  80, 250),
+    ('plan',     400, 190),
+    ('spec',     620, 130),
+    ('spec',     620, 250),
+    ('task',     820, 85),
+    ('task',     820, 155),
+    ('task',     820, 225),
+    ('task',     820, 295),
+    ('evidence', 1040, 130),
+    ('evidence', 1040, 250),
+]
+
+# Lineage edges, by node index. Only two tasks reach evidence: a retro is
+# offered, never required, and a diagram that drew four would promise otherwise.
+EDGES = [(0, 2), (1, 2), (2, 3), (2, 4),
+         (3, 5), (3, 6), (4, 7), (4, 8),
+         (6, 9), (7, 10)]
+
+LEFT, RIGHT = 40, 1140
+W, H = 1180, 430
+
+
+def trim(a, b, pad=R + 1):
+    """Shorten a segment to the circles' edges so the arrowhead lands clean."""
+    (x1, y1), (x2, y2) = a, b
+    dx, dy = x2 - x1, y2 - y1
+    d = (dx * dx + dy * dy) ** 0.5 or 1
+    ux, uy = dx / d, dy / d
+    return (x1 + ux * pad, y1 + uy * pad, x2 - ux * pad, y2 - uy * pad)
+
+
+def render(t):
+    p = [
+        f'<svg viewBox="0 0 {W} {H}" '
+        f'xmlns="http://www.w3.org/2000/svg" role="img" aria-label="'
+        'Four dashed regions left to right: Intent holding a goal and a decision, '
+        'Approach holding a plan and two specs, Action holding four tasks, and '
+        'Evidence holding two evidence nodes. Arrows run from intent through '
+        'approach and action to evidence. Beneath, one arrow labelled '
+        'IMPLEMENTATION runs left to right, and one labelled REVIEW / AMEND runs '
+        'right to left, closing the loop from Evidence back to Intent.">',
+        '<defs>',
+        f'<marker id="h" viewBox="0 -5 10 10" refX="9" refY="0" markerWidth="6" '
+        f'markerHeight="6" orient="auto"><path d="M0,-4L9,0L0,4" fill="{t["edge"]}"/></marker>',
+        f'<marker id="r" viewBox="0 -5 10 10" refX="9" refY="0" markerWidth="6" '
+        f'markerHeight="6" orient="auto"><path d="M0,-4L9,0L0,4" fill="{t["rail"]}"/></marker>',
+        '</defs>',
+    ]
+
+    for label, x, w, cx in BOXES:
+        p.append(f'<rect x="{x}" y="{BOX_Y}" width="{w}" height="{BOX_H}" fill="none" '
+                 f'stroke="{t["box"]}" stroke-width="1.2" stroke-dasharray="5 4"/>')
+        p.append(f'<text x="{cx}" y="{BOX_Y - 8}" text-anchor="middle" font-family="{MONO}" '
+                 f'font-size="11" letter-spacing="1.5" fill="{t["boxlabel"]}" '
+                 f'font-weight="700">{label}</text>')
+
+    for i, j in EDGES:
+        x1, y1, x2, y2 = trim(NODES[i][1:3], NODES[j][1:3])
+        p.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+                 f'stroke="{t["edge"]}" stroke-width="1.4" marker-end="url(#h)"/>')
+
+    for kind, cx, cy in NODES:
+        p.append(f'<circle cx="{cx}" cy="{cy}" r="{R}" fill="{PALETTE[kind]}" '
+                 f'stroke="{NODE_STROKE}" stroke-width="1.2"/>')
+        p.append(f'<text x="{cx}" y="{cy + 33}" text-anchor="middle" font-family="{MONO}" '
+                 f'font-size="14" fill="{t["nodelabel"]}">{kind}</text>')
+
+    for y, label, rev in ((374, 'IMPLEMENTATION', False), (408, 'REVIEW / AMEND', True)):
+        a, b = (RIGHT, LEFT) if rev else (LEFT, RIGHT)
+        p.append(f'<line x1="{a}" y1="{y}" x2="{b}" y2="{y}" stroke="{t["rail"]}" '
+                 f'stroke-width="1.6" marker-end="url(#r)"/>')
+        p.append(f'<text x="590" y="{y - 8}" text-anchor="middle" font-family="{MONO}" '
+                 f'font-size="13" letter-spacing="1.5" fill="{t["rail"]}" '
+                 f'font-weight="700">{label}</text>')
+
+    p.append('</svg>')
+    return '\n'.join(p) + '\n'
+
+
+def main():
+    for name, theme in THEMES.items():
+        path = os.path.normpath(os.path.join(OUT, name))
+        open(path, 'w', encoding='utf-8').write(render(theme))
+        print(f'wrote {os.path.relpath(path, os.path.dirname(OUT))}')
+
+
+if __name__ == '__main__':
+    main()

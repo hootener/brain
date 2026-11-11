@@ -1,0 +1,93 @@
+# Keeps the brain's claims checkable in CI (D0001).
+#
+# One file serves both layouts: it locates the brain by finding `bin/lint`,
+# so it works unchanged whether the brain is this repository (sibling mode) or
+# a `brain/` directory inside a host repository (embedded, the D0004 default).
+# `bin/adopt` copies it verbatim into the host's `.github/workflows/`.
+#
+# No dependencies and no setup step: every tool here is stdlib Python 3.
+name: brain
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # bin/reconcile compares task status against what the history shows,
+          # which needs more than the default single commit.
+          fetch-depth: 0
+
+      - name: Locate the brain
+        run: |
+          for d in . brain; do
+            if [ -x "$d/bin/lint" ]; then echo "BRAIN=$d" >> "$GITHUB_ENV"; exit 0; fi
+          done
+          echo "::error::no brain/bin/lint found at the repo root or in brain/"
+          exit 1
+
+      # The gate. Errors fail the build; warnings never do — an unresolved link
+      # is a valid marker of future work, and failing on one would teach people
+      # to stop writing them.
+      - name: lint
+        run: $BRAIN/bin/lint
+
+      # A countable claim that contradicts the repository is a false statement
+      # a reader will meet, so it fails rather than warns.
+      - name: stale
+        run: $BRAIN/bin/stale
+
+      - name: doctor
+        run: $BRAIN/bin/doctor
+
+      # A field the record carries that no tool reads is inert without ever
+      # looking lost: `consent_by` named the date an agreement turned on and
+      # sat unread for three rounds. Nothing dangles, so nothing else catches
+      # it.
+      - name: unread
+        run: $BRAIN/bin/unread
+
+      # A fresh install into a throwaway host, plus a corpus deliberately not
+      # written for this brain. Every defect this project has fixed was found
+      # by adoption and none by its own checks; this keeps a sample of that
+      # permanently rather than waiting for the next real project to notice.
+      - name: selftest
+        run: $BRAIN/bin/selftest
+
+      # graph.html is a generated file that is committed, so it goes stale
+      # silently — a stale graph looks exactly like a current one.
+      #
+      # `--check` rather than rebuild-and-diff: every build stamps a fresh
+      # `generated` time and the whole payload is one line, so a plain diff
+      # reports the file as changed on every run. That check would have failed
+      # forever while looking like a real finding.
+      - name: graph is current
+        run: $BRAIN/bin/graph-build --check
+
+      # Reported, never enforced: which decisions govern the files this change
+      # touches. Writes to the run summary, so it needs no token and no
+      # permissions. Deciding whether a decision is contradicted is a person's
+      # job (D0005); surfacing the candidates is not.
+      - name: decisions in force for this change
+        if: github.event_name == 'pull_request'
+        run: |
+          {
+            echo "## Decisions in force for this change"
+            echo
+            git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD \
+              | xargs -r $BRAIN/bin/constraints || echo "_none matched_"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Status drift against the history. Reported, not enforced: an ambiguous
+      # status is a question for the operator, which is what /audit is for.
+      - name: status reconciliation
+        continue-on-error: true
+        run: |
+          { echo "## Status reconciliation"; echo; echo '```'
+            $BRAIN/bin/reconcile || true
+            echo '```'; } >> "$GITHUB_STEP_SUMMARY"

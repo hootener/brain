@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Rebuild every folder index from the nodes actually present.
+
+Usage:
+    brain/bin/index
+    brain/bin/index --check     # report drift and write nothing
+
+Exit 1 from --check when an index disagrees with its folder.
+
+## Why this is a tool and not a habit
+
+`howto.md` promised that the skills handle "the index upkeep" and `CLAUDE.md`
+told you not to hand-edit an index — and **nothing wrote one**. A by-the-book
+greenfield adoption ended with `goals/index.md` saying *"(none yet)"* while
+three nodes sat on disk beside it. The first adopter hand-edited all three
+against instructions, because there was no alternative.
+
+An index that confidently says "none yet" is the stale note this whole project
+argues is worse than no note at all, and it was shipped by the documentation
+itself.
+
+Regenerating beats appending: appending has to parse whatever shape the index
+is in and guess where the row goes, and it drifts the moment anyone deletes a
+node. Regenerating is idempotent and cannot be wrong about what exists.
+
+**`log.md` is not regenerated.** It is an append-only account of what happened,
+in prose, and a generator would flatten it into a list of filenames.
+"""
+import argparse
+import os
+import re
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+# folder -> (heading, blurb, empty-state hint)
+INDEXES = {
+    'knowledge-catalog/goals': (
+        'Goals',
+        'What done looks like, and the signals that say so. A goal is an outcome, never\n'
+        'an implementation; the plans and specs that pursue it name it in their\n'
+        '`serves:` field, and every lineage walk terminates here.',
+        'brain/bin/new goal "<the outcome>"'),
+    'knowledge-catalog/decisions': (
+        'Decisions',
+        'Choices made, with the alternatives considered and the evidence behind them.\n'
+        'Numbered in the `D` sequence, which **principles share** — a principle is a\n'
+        'decision with no alternatives and no expiry. Superseded, never deleted.',
+        'brain/bin/new decision "<the claim>"'),
+    'knowledge-catalog/specs': (
+        'Specs',
+        '**Approach.** Feature specs, in the shape `/to-spec` writes and `/to-tasks`\n'
+        'consumes. A spec carries `serves:` pointing at the goal it pursues; that edge\n'
+        'is what lets a reverse walk terminate in Intent.',
+        'brain/bin/new spec "<feature>"'),
+    'knowledge-catalog/reference': (
+        'Reference',
+        '**Evidence**: how things actually are, as opposed to how they were decided to\n'
+        'be. Stack facts, measurements, gotchas, research notes, and what a review or\n'
+        'an audit found.\n\n'
+        'An evidence node that corrects something upstream carries `amends:`; one that\n'
+        'records a looking-back pass carries `reviewed:`; one that was given rather\n'
+        'than gathered carries `resource:`. A plain measurement carries none.',
+        'brain/bin/new evidence "<what you observed>"'),
+    'plans': (
+        'Plans',
+        'How things get built: implementation plans, sequencing, and the reasoning\n'
+        'behind an approach. A plan carries `serves:` pointing at the goal it pursues.\n\n'
+        'Plans are **not** decisions. A decision says what we chose and why; a plan\n'
+        'says how we intend to carry it out, and is superseded by what actually\n'
+        'shipped rather than deleted, so the gap between intent and outcome stays\n'
+        'visible.',
+        'brain/bin/new plan "<what it builds>"'),
+}
+
+ID_IN_NAME = re.compile(r'^([GDPSTE]\d{4})-')
+
+
+def frontmatter(text):
+    if not text.startswith('---'):
+        return {}
+    end = text.find('\n---', 3)
+    out = {}
+    for line in text[3:end if end != -1 else None].split('\n'):
+        if ':' in line and not line.startswith(' '):
+            k, v = line.split(':', 1)
+            out[k.strip()] = v.strip().strip('"\'')
+    return out
+
+
+def nodes_in(folder):
+    path = os.path.join(ROOT, folder)
+    found = []
+    if not os.path.isdir(path):
+        return found
+    for name in sorted(os.listdir(path)):
+        if not name.endswith('.md') or not ID_IN_NAME.match(name):
+            continue
+        meta = frontmatter(open(os.path.join(path, name), encoding='utf-8').read())
+        found.append({'id': ID_IN_NAME.match(name).group(1), 'file': name,
+                      'title': meta.get('title', name), 'type': meta.get('type', ''),
+                      'status': meta.get('status', '')})
+    return found
+
+
+def render(folder, heading, blurb, hint):
+    rows = nodes_in(folder)
+    out = [f'# {heading}', '', blurb, '']
+    if not rows:
+        out += [f'*(none yet — `{hint}`)*', '']
+        return '\n'.join(out)
+
+    show_type = folder.endswith('decisions')
+    header = '| id | | Title |' if show_type else '| id | Status | Title |'
+    out += [header, '|---|---|---|']
+    for r in rows:
+        mid = r['type'] if show_type else (r['status'] or '')
+        out.append(f'| [{r["id"]}]({r["file"]}) | {mid} | {r["title"]} |')
+    out.append('')
+    return '\n'.join(out)
+
+
+def task_indexes():
+    """One per initiative, listing its tasks with status."""
+    base = os.path.join(ROOT, 'tasks')
+    out = {}
+    if not os.path.isdir(base):
+        return out
+    for init in sorted(os.listdir(base)):
+        folder = os.path.join(base, init)
+        if not os.path.isdir(folder):
+            continue
+        rows = nodes_in(f'tasks/{init}')
+        body = [f'# {init}', '',
+                f'Tasks for the **{init}** initiative. '
+                f'`brain/bin/status {init}` shows what is claimable now.', '']
+        if rows:
+            body += ['| id | Status | Title |', '|---|---|---|']
+            body += [f'| [{r["id"]}]({r["file"]}) | {r["status"]} | {r["title"]} |' for r in rows]
+            body.append('')
+        else:
+            body += [f'*(none yet — `brain/bin/new task "<title>" --initiative {init}`)*', '']
+        out[f'tasks/{init}/index.md'] = '\n'.join(body)
+    return out
+
+
+TEMPLATE_RECORD = '.template-record'
+
+
+def write_template_record():
+    """List the template's own nodes, so an adopt can tell them from yours.
+
+    `bin/adopt` identified the template's record by filename *pattern* —
+    `knowledge-catalog/decisions/D*.md` — which is every decision anybody will
+    ever write. A first adopt into a brain that already held content swept the
+    adopter's own `D0001` into `example/` and called it ours.
+
+    Identity, not pattern. Written here because this is the tool that already
+    walks every node, and only while the brain is still the unadopted
+    template: once adopted, the file is a record of what *was* shipped and
+    must not be regenerated from the adopter's catalog.
+    """
+    cfg = os.path.join(ROOT, 'config.md')
+    mode = ''
+    if os.path.isfile(cfg):
+        m = re.search(r'^mode:\s*(\S+)', open(cfg, encoding='utf-8').read(), re.M)
+        mode = m.group(1).strip('"\'') if m else ''
+    if mode != 'template':
+        return
+
+    rows = []
+    for folder in ('knowledge-catalog/goals', 'knowledge-catalog/decisions',
+                   'knowledge-catalog/reference'):
+        rows += [f'{folder}/{n["file"]}' for n in nodes_in(folder)]
+    for extra in ('tasks/formalize', 'plans/formalize'):
+        if os.path.isdir(os.path.join(ROOT, extra)):
+            rows.append(extra)
+
+    open(os.path.join(ROOT, TEMPLATE_RECORD), 'w', encoding='utf-8').write(
+        "# The template's own record, by identity rather than by pattern.\n"
+        "# bin/adopt relocates exactly these to example/ and nothing else, so a\n"
+        "# brain that already holds its own D0001 keeps it. Regenerated by\n"
+        "# bin/index while this is still the unadopted template.\n"
+        + '\n'.join(sorted(rows)) + '\n')
+
+
+UPSTREAM = 'https://github.com/hootener/brain/blob/main'
+
+
+def write_upstream_invariants():
+    """Ship the invariants that govern the generic tooling, beside it.
+
+    `knowledge-catalog/decisions/` is in the never-touched half of the split,
+    so a decision whose `constrains:` names `bin/**` could not travel with the
+    `bin/**` it governs. An adopter running `bin/constraints bin/handoff` was
+    told no decision governs those paths, while the decision saying otherwise
+    sat upstream where their tooling could not see it: the one part of the
+    record that could not ship with the code was the part about the code.
+
+    These cannot ship as nodes — the ids would collide with the adopter's, and
+    D0003 makes ids permanent. So they ship as a manifest in `docs/`, which is
+    generic. `bin/constraints` reads it after the local catalog, and a local
+    node of the same id wins, because that is the one their tasks cite.
+    """
+    cfg = os.path.join(ROOT, 'config.md')
+    mode = ''
+    if os.path.isfile(cfg):
+        m = re.search(r'^mode:\s*(\S+)', open(cfg, encoding='utf-8').read(), re.M)
+        mode = m.group(1).strip('"\'') if m else ''
+    if mode != 'template':
+        return
+
+    out = [
+        '# Invariants the template ships with its tooling',
+        '',
+        'Generated by `bin/index` from this brain\'s own decisions, for the ones',
+        'that declare they govern generic paths. `bin/constraints` reads this after',
+        'your own catalog, so a decision about `bin/**` reaches you along with the',
+        '`bin/**` it governs. Your own node of the same id always wins.',
+        '',
+        'Do not edit: it is regenerated upstream and replaced by `bin/update`.',
+        '',
+    ]
+    folder = os.path.join(ROOT, 'knowledge-catalog', 'decisions')
+    GENERIC = ('bin/', 'skills/', 'hooks/', 'docs/', '.github/',
+               'knowledge-catalog/reference/agent-skills/')
+    for node in nodes_in('knowledge-catalog/decisions'):
+        text = open(os.path.join(folder, node['file']), encoding='utf-8').read()
+        meta = frontmatter(text)
+        # `constrains:` is usually written as a block sequence, which this
+        # file's flat parser reads as an empty string — the same YAML bug that
+        # once let `constrains:` govern nothing past a green lint. Read the
+        # items directly rather than re-deriving them.
+        governs = []
+        m = re.search(r'^constrains:\s*$(.*?)^\S', text, re.M | re.S)
+        if m:
+            governs = [l.strip()[2:].strip().strip('"\'')
+                       for l in m.group(1).split('\n')
+                       if l.strip().startswith('- ')]
+        elif meta.get('constrains'):
+            raw = meta['constrains'].strip('[]')
+            governs = [g.strip().strip('"\'') for g in raw.split(',') if g.strip()]
+        governs = [g for g in governs if str(g).startswith(GENERIC)]
+        if not governs or not meta.get('invariant'):
+            continue
+        out.append(f'## {meta.get("id", "")} {meta.get("title", "")}')
+        out.append(f'- invariant: {meta["invariant"]}')
+        out.append('- constrains: ' + ', '.join(governs))
+        out.append(f'- url: {UPSTREAM}/knowledge-catalog/decisions/{node["file"]}')
+        out.append('')
+
+    path = os.path.join(ROOT, 'docs', 'upstream-invariants.md')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fresh = '\n'.join(out)
+    if not os.path.isfile(path) or open(path, encoding='utf-8').read() != fresh:
+        open(path, 'w', encoding='utf-8').write(fresh)
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Rebuild folder indexes from the nodes present.')
+    ap.add_argument('--check', action='store_true')
+    args = ap.parse_args()
+
+    wanted = {f'{folder}/index.md': render(folder, *spec)
+              for folder, spec in INDEXES.items()}
+    wanted.update(task_indexes())
+
+    drift, wrote = [], []
+    for rel, body in wanted.items():
+        path = os.path.join(ROOT, rel)
+        current = open(path, encoding='utf-8').read() if os.path.isfile(path) else None
+        if current == body:
+            continue
+        if args.check:
+            drift.append(rel)
+        else:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, 'w', encoding='utf-8').write(body)
+            wrote.append(rel)
+
+    if args.check:
+        for d in drift:
+            print(f'  stale  {d}')
+        print(f'\n  {len(drift)} index(es) disagree with their folder'
+              if drift else '  Every index matches its folder.')
+        return 1 if drift else 0
+
+    if not args.check:
+        write_template_record()
+        write_upstream_invariants()
+
+    for w in wrote:
+        print(f'  wrote {w}')
+    print(f'\n  {len(wrote)} index(es) rebuilt' if wrote else '  Every index was already current.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

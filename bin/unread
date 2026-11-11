@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""Find frontmatter the record carries that no tool reads.
+
+Usage: brain/bin/unread [--quiet]
+Exit 1 if any field is carried by nodes and read by nothing. Exit 0 otherwise.
+
+## Why this exists
+
+This is the third class of defect, named by the third project to adopt this
+brain after the first two classes had been given instruments:
+
+  * `bin/prove` catches a tool whose output disagrees with the filesystem.
+  * D0011 catches a change that infers the shape of someone else's corpus.
+  * **Nothing checked the record against the tooling.**
+
+Two instances, the same shape, three rounds apart. `consent_by:` sat on a plan
+for three rounds, naming the date an agreement turned on, and no tool read it —
+so a handoff built from that plan could not carry the one fact its reader
+needed. Then `flag:` appeared on four plans while a decision made flagging step
+one of the standard path, and nothing read that either.
+
+Both are quiet in the worst way. Writing the field is harmless; the field is
+simply inert. **A field that mattered becomes invisible without ever looking
+lost** — there is no error, no dangling link, and the author has every reason
+to believe the value is doing something.
+
+## What it can and cannot catch
+
+It catches a *name* in frontmatter that appears in no tool and no skill. That
+is narrow on purpose: it cannot tell you a field is read *badly*, or that a
+tool reads it and then discards it. What it proves is only that somebody,
+somewhere in `bin/` or `skills/`, has written the field's name down.
+
+The inverse — a tool reading a field no node carries — is reported too, as a
+note. That one is usually a rename that only landed on one side.
+"""
+import argparse
+import fnmatch
+import os
+import re
+import sys
+
+BRAIN = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+# Skipped: the structural keys every template writes, which the whole toolchain
+# is built around and which would be noise in every run.
+STRUCTURAL = {
+    'id', 'type', 'title', 'description', 'status', 'timestamp', 'tags',
+    'initiative', 'blocked_by', 'serves', 'invariant', 'constrains',
+    'superseded_by', 'amends', 'append_only', 'category', 'claimed_by',
+    'wontfix', 'mode', 'repos', 'brain_revision', 'handed_to',
+    'initiative_plan',
+    # config.md's own keys. It is scanned like any node, so an install setting
+    # read it as record data — including `human_fields`, the key that exists to
+    # silence this check, reported by this check.
+    'human_fields', 'okf_version', 'tracker', 'docs', 'notes',
+}
+
+SKIP_DIRS = {'.git', 'node_modules', '__pycache__', 'example', 'feedback',
+             'templates', 'docs'}
+READERS = ('bin', 'skills', 'hooks')
+
+
+def nodes():
+    for base, dirs, files in os.walk(BRAIN):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        if os.path.basename(base) in READERS:
+            dirs[:] = []
+            continue
+        for name in sorted(files):
+            if not name.endswith('.md'):
+                continue
+            path = os.path.join(base, name)
+            try:
+                text = open(path, encoding='utf-8').read()
+            except OSError:
+                continue
+            if not text.startswith('---'):
+                continue
+            end = text.find('\n---', 3)
+            if end == -1:
+                continue
+            yield os.path.relpath(path, BRAIN), text[3:end]
+
+
+def fields():
+    """Every frontmatter key in the record, and which nodes carry it."""
+    out = {}
+    for rel, block in nodes():
+        for line in block.split('\n'):
+            if ':' not in line or line.startswith((' ', '-', '#')):
+                continue
+            key, _, value = line.partition(':')
+            key = key.strip()
+            if not re.match(r'^[a-z][a-z0-9_]*$', key) or key in STRUCTURAL:
+                continue
+            out.setdefault(key, []).append((rel, value.strip().strip('"\'')))
+    return out
+
+
+def reader_text():
+    """Everything in the brain that could read a field."""
+    chunks = []
+    for folder in READERS:
+        root = os.path.join(BRAIN, folder)
+        for base, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in {'.git', '__pycache__'}]
+            for name in files:
+                if name.endswith(('.pyc',)):
+                    continue
+                # Not this file. Its own prose names the fields that prompted
+                # it — `consent_by`, `flag` — so it reported every field as
+                # read, including the two it was written to catch.
+                if (os.path.realpath(os.path.join(base, name))
+                        == os.path.realpath(__file__)):
+                    continue
+                try:
+                    text = open(os.path.join(base, name),
+                                encoding='utf-8', errors='ignore').read()
+                except OSError:
+                    continue
+                chunks.append(strip_commentary(text))
+    return '\n'.join(chunks)
+
+
+def strip_commentary(text):
+    """Drop comments and docstrings, so prose about a field is not a read.
+
+    `consent_by` passed because a code *comment* quoted it — the right answer
+    on the wrong evidence: delete the comment and a live consent date reads as
+    dead. A field is read when a tool asks for it, not when a tool talks about
+    it.
+    """
+    # Triple-quoted blocks first, then line comments. Crude on purpose: this
+    # only ever needs to decide whether a name appears in executable context.
+    text = re.sub(r'""".*?"""|\'\'\'.*?\'\'\'', '', text, flags=re.S)
+    out = []
+    for line in text.split('\n'):
+        stripped = line.lstrip()
+        if stripped.startswith('#'):
+            continue
+        out.append(line.split('  #')[0] if '  #' in line else line)
+    return '\n'.join(out)
+
+
+def human_fields():
+    """Fields the brain declares are read by people, deliberately.
+
+    Without this the tool is a trap it would itself have reported. An adopter
+    kept `decided_by` on a considered argument — two of their decisions
+    contradict each other on the facts, and it is the only thing making the
+    founder's call outrank the engineer's inference — and nothing reads it, so
+    this would have failed their CI on every run, forever. A permanently red
+    check is a stale note, which is D0001 applied to the gate, and the record
+    already paid for that lesson once.
+
+    Declared in `config.md`, because it is a statement about this install's
+    record rather than about any tool:
+
+        human_fields: [decided_by, owner]
+
+    The declaration is the answer to the test, not an escape from it: a field
+    listed here is one somebody argued changes how a conflicting record is
+    read. Listing a field you merely like is how this check stops working.
+    """
+    cfg = os.path.join(BRAIN, 'config.md')
+    if not os.path.isfile(cfg):
+        return []
+    m = re.search(r'^human_fields:\s*(.+)$',
+                  open(cfg, encoding='utf-8').read(), re.M)
+    if not m:
+        return []
+    return [f.strip().strip('"\'') for f in m.group(1).strip('[]').split(',')
+            if f.strip()]
+
+
+def declared_shapes():
+    """Field-name patterns tools say they read.
+
+    Some fields are read by *shape* rather than by name: `bin/handoff` renders
+    any `*_by` / `*_on` / `*_date` key, so no search for `consent_by` finds the
+    code that reads it. That field passed only because a comment quoted it —
+    the right answer on evidence that would vanish with the comment.
+
+    A declaration is the fix, and it is the same preference D0011 states:
+    **an inference fails as a confident wrong answer, a declaration fails as
+    absence.** A tool that reads by shape says so in a
+    `# reads-frontmatter:` line, and is answerable for keeping it honest.
+    """
+    out = []
+    for folder in READERS:
+        for base, dirs, files in os.walk(os.path.join(BRAIN, folder)):
+            dirs[:] = [d for d in dirs if d not in {'.git', '__pycache__'}]
+            for name in files:
+                full = os.path.join(base, name)
+                # Not this file: its own prose explains the convention, and
+                # that prose parsed as nine declarations including a fragment
+                # of its own regex. Third time this self-reference has bitten.
+                if os.path.realpath(full) == os.path.realpath(__file__):
+                    continue
+                try:
+                    text = open(full, encoding='utf-8', errors='ignore').read()
+                except OSError:
+                    continue
+                for m in re.finditer(r'^\s*#\s*reads-frontmatter:\s*(.+)$',
+                                     text, re.M):
+                    for part in m.group(1).split(','):
+                        part = part.strip()
+                        if not part or len(part) > 40:
+                            continue
+                        pat, _, kind = part.partition('=')
+                        out.append((pat.strip(), kind.strip() or 'any'))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description='Frontmatter the record carries that no tool reads.')
+    ap.add_argument('--quiet', action='store_true')
+    args = ap.parse_args()
+
+    carried = fields()
+    text = reader_text()
+    shapes = declared_shapes()
+    human = human_fields()
+
+    def is_read(key):
+        if key in human:
+            return True
+        """Does some tool name this field, in a shape that means reading it?
+
+        A bare word match was too loose: `flag` was satisfied by the word
+        "flag" in prose about command-line flags, which is exactly the field
+        that prompted this tool. So the name has to appear either as a string
+        literal — how a parser asks for a key — or followed by a colon, how a
+        skill documents one.
+        """
+        # A shape declaration can name the *kind* of value it consumes, and
+        # must: `bin/handoff` renders any `*_by` key whose value is an ISO
+        # date, so a bare `*_by` claim also covered `decided_by: "Eli"` —
+        # a field with no reader at all, passing on a declaration that did not
+        # mean it. Measured on a third adopter's corpus.
+        for pat, kind in shapes:
+            if not fnmatch.fnmatch(key, pat):
+                continue
+            if kind == 'any':
+                return True
+            if kind == 'date' and any(
+                    re.match(r'\d{4}-\d{2}-\d{2}', v) for _, v in carried[key]):
+                return True
+        k = re.escape(key)
+        return bool(re.search(rf'[\'"]{k}[\'"]', text)
+                    or re.search(rf'(?<![\w-]){k}:', text))
+
+    unread = {k: v for k, v in carried.items() if not is_read(k)}
+
+    # A key reached through a loop variable is read, and no textual match can
+    # see it: `for k in ('serves', 'spec'):` names them, but
+    # `for key in meta:` names nothing. Where a tool iterates a node's whole
+    # frontmatter, every field is potentially read, so say so rather than
+    # reporting a field as dead on evidence this tool cannot have.
+    iterates = bool(re.search(r'for\s+\w+(?:,\s*\w+)?\s+in\s+'
+                              r'(?:sorted\()?(?:fm|meta|front\w*)'
+                              r'(?:\.items\(\))?', text))
+
+    if not args.quiet:
+        print('Frontmatter in the record, checked against bin/, skills/ and hooks/')
+        print()
+        print(f'  {len(carried)} non-structural field(s) carried, '
+              f'{len(carried) - len(unread)} read by something.')
+        if shapes:
+            print(f'  {len(shapes)} declared field shape(s): '
+                  + ', '.join(f'{p}={k}' for p, k in shapes))
+        if human:
+            print(f'  {len(human)} field(s) declared read by people, not tools: '
+                  + ', '.join(human))
+        print()
+
+    if not unread:
+        if not args.quiet:
+            print('  Every field the record carries is named by some tool.')
+        return 0
+
+    for key in sorted(unread):
+        where = [r for r, _ in unread[key]]
+        print(f'  UNREAD  {key}')
+        print(f'          on {len(where)} node(s): ' + ', '.join(where[:3])
+              + (f' … and {len(where) - 3} more' if len(where) > 3 else ''))
+        print()
+
+    print(f'  {len(unread)} field(s) are written and read by nothing.')
+    print()
+    print('  A field no tool reads is not automatically dead. The test an')
+    print('  adopter proposed, and it is better than "might someone like it":')
+    print('  **does it change how a conflicting record is read?** Theirs kept')
+    print('  `decided_by` on that basis — two of their decisions contradict')
+    print('  each other on the facts, and the founder\'s call about her own')
+    print('  business overriding an engineer\'s inference is only legible')
+    print('  because each says who decided it. No tool needs to read that for')
+    print('  it to be true. The same brain dropped `owner`, which was one name')
+    print('  on all six tasks and arbitrated nothing.')
+    if iterates:
+        print('  Caveat: some tool iterates frontmatter wholesale, so a field')
+        print('  may be read through a loop variable this check cannot see.')
+        print('  Treat the list as candidates, not as a verdict.')
+    print('  Either a tool should read it, or the field should go. A value')
+    print('  that drives a workflow and is read by no tool is a fact the')
+    print('  record believes it is carrying and is not.')
+    return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

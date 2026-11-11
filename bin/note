@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Record something without deciding what kind of thing it is.
+
+Usage:
+    brain/bin/note "client says 24h cancellation, not 48"
+    brain/bin/note --initiative retainer "Ashlee wants blocks per student"
+    brain/bin/note --review              # entries nobody has classified yet
+    brain/bin/note --list                # where the running records are
+
+Exit 0 unless the note could not be written.
+
+## Why this exists
+
+Three adoptions reported the same overhead and the third one measured it:
+**ceremony runs 15-25% per change, and it sits in the wrong place.** Their
+sentence is the whole brief for this tool:
+
+> Writing is cheap, choosing the category is the cost and has no tool.
+
+Choosing costs more than writing because it is a decision with seven answers,
+most of them wrong, taken at the worst moment — while something is still
+happening. The same project reported that the thing which actually earned its
+keep was not a typed node at all: an append-only prose journal that caught a
+wrong cancellation policy before it went out to every family, and turned a
+second mislabelled notification into "this is a pattern".
+
+So this separates the two costs. A note goes in now, dated, with no type, no
+folder, no id and no required headings. Classification happens later if it
+happens at all — `--review` lists what has not been promoted, and
+`bin/which` answers the question when you are ready to ask it.
+
+**This is not a new node type.** The entry lands in an ordinary `evidence`
+node carrying `append_only: true`, which the direction rule already exempts
+from the no-citing-newer constraint. The brain gains a cheaper door, not a
+different shape.
+
+## What it deliberately does not do
+
+It does not guess the type. D0011 is explicit that a tool reading the
+adopter's corpus and deciding what it means is the failure class behind every
+semantic defect found so far, and a classifier run on prose at capture time is
+exactly that with the stakes reversed — a wrong type is worse than none,
+because a typed node looks decided.
+"""
+# reads-frontmatter: notes
+import argparse
+import os
+import re
+import subprocess
+import sys
+from datetime import date
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+REFERENCE = os.path.join(ROOT, 'knowledge-catalog', 'reference')
+
+# The marker that makes an entry findable later. A note is promotable until
+# somebody has decided what it is; nothing deletes the entry when they do,
+# because the journal is append-only — the marker is struck through instead.
+OPEN = '· unclassified'
+DONE = '· classified'
+
+
+def run(args):
+    return subprocess.run(args, cwd=ROOT, capture_output=True, text=True)
+
+
+def records():
+    """The notes records: evidence nodes marked `notes: true`.
+
+    Identified by a declared marker, not by shape. Picking "the first
+    append_only evidence node with no initiative" sent a note about a client's
+    cancellation policy into this brain's own record of adoption findings —
+    a topical journal that happens to have the same shape. Same
+    pattern-versus-identity mistake as `.template-record`, caught here before
+    it shipped.
+    """
+    out = []
+    if not os.path.isdir(REFERENCE):
+        return out
+    for name in sorted(os.listdir(REFERENCE)):
+        if not name.endswith('.md') or not re.match(r'^E\d{4}-', name):
+            continue
+        path = os.path.join(REFERENCE, name)
+        text = open(path, encoding='utf-8').read()
+        head = text[:text.find('\n---', 3)] if text.startswith('---') else ''
+        if re.search(r'^notes:\s*true', head, re.M):
+            m = re.search(r'^initiative:\s*(.+)$', head, re.M)
+            out.append({
+                'path': path,
+                'name': name,
+                'initiative': (m.group(1).strip().strip('"\'') if m else ''),
+                'title': (re.search(r'^title:\s*(.+)$', head, re.M)
+                          or [None, name]).__getitem__(1).strip().strip('"\''),
+            })
+    return out
+
+
+def pick(initiative):
+    """The record a note belongs in: this initiative's, else the general one."""
+    found = records()
+    if initiative:
+        for r in found:
+            if r['initiative'] == initiative:
+                return r
+    general = [r for r in found if not r['initiative']]
+    return general[0] if general else (found[0] if found else None)
+
+
+def create(initiative):
+    """Open a running record, through bin/new so the id is allocated properly."""
+    title = (f'{initiative} running record' if initiative
+             else 'Running record')
+    args = [os.path.join(ROOT, 'bin', 'new'), 'evidence', title]
+    if initiative:
+        args += ['--initiative', initiative]
+    p = run(args)
+    if p.returncode != 0:
+        print(p.stdout + p.stderr, file=sys.stderr)
+        return None
+
+    m = re.search(r'(knowledge-catalog/reference/E\d{4}-[^\s]+\.md)',
+                  p.stdout + p.stderr)
+    if not m:
+        print('bin/new did not report a path:\n' + p.stdout + p.stderr,
+              file=sys.stderr)
+        return None
+
+    path = os.path.join(ROOT, m.group(1))
+    text = open(path, encoding='utf-8').read()
+
+    # The template has no `append_only`, and without it the direction rule
+    # would object the first time an entry cited something older than the
+    # node — which for a journal is every entry.
+    if 'append_only' not in text:
+        text = text.replace('\ntags:', '\nappend_only: true\ntags:', 1)
+    # The marker bin/note finds it by. Declared, so nothing has to infer which
+    # journal a note belongs in.
+    if not re.search(r'^notes:', text, re.M):
+        text = text.replace('\nappend_only: true', '\nappend_only: true\nnotes: true', 1)
+    text = re.sub(r'^description: .*$',
+                  'description: "Dated entries recorded as work happened, '
+                  'before anybody decided what kind of thing each one is."',
+                  text, count=1, flags=re.M)
+    text = re.sub(r'^status: .*$', 'status: active', text, count=1, flags=re.M)
+    # The evidence template offers optional edges as commented scaffolds, and
+    # a journal has no origin document to name. Left in, `resource:
+    # <link or URL to the original>` is an unfilled placeholder the gate
+    # rejects — so a tool whose whole purpose is zero friction would have
+    # handed every first-time user two lint errors.
+    text = re.sub(r'^resource: <[^>\n]*>\n', '', text, flags=re.M)
+    text = text.replace(
+        '# Present when the evidence was given rather than gathered — the brief.\n',
+        '')
+    # Same for the body. The evidence template prompts for one observation
+    # with its denominator and sample; a journal is many entries and has no
+    # single one, so the prompts are replaced by what this node actually is.
+    head, sep, body = text.partition('\n---\n')
+    body = re.sub(r'<[^>\n]*(?:\n[^>\n]*)*>', '', body)
+    body = re.sub(r'\n{3,}', '\n\n', body).strip()
+    opener = ('Entries are appended by `bin/note`, newest last, each dated and '
+              'left unclassified\nuntil somebody decides it is worth typing. '
+              'An entry that never becomes a node\nstill did its job the day '
+              'it was written.\n')
+    text = head + sep + '\n' + opener + ('\n' + body if body else '') + '\n'
+    open(path, 'w', encoding='utf-8').write(text)
+    return {'path': path, 'name': os.path.basename(path),
+            'initiative': initiative, 'title': title}
+
+
+def append(record, text):
+    body = open(record['path'], encoding='utf-8').read().rstrip('\n')
+    today = date.today().isoformat()
+    entry = f'\n\n## {today} {OPEN}\n\n{text.strip()}\n'
+    open(record['path'], 'w', encoding='utf-8').write(body + entry)
+
+
+def review():
+    rows = []
+    for r in records():
+        text = open(r['path'], encoding='utf-8').read()
+        for m in re.finditer(rf'^## (\S+) {re.escape(OPEN)}\s*$(.*?)(?=^## |\Z)',
+                             text, re.M | re.S):
+            rows.append((r['name'], m.group(1),
+                         re.sub(r'\s+', ' ', m.group(2)).strip()[:92]))
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description='Record something without deciding what kind of thing it is.')
+    ap.add_argument('text', nargs='*')
+    ap.add_argument('--initiative', default='')
+    ap.add_argument('--review', action='store_true',
+                    help='entries nobody has classified yet')
+    ap.add_argument('--list', action='store_true',
+                    help='the running records in this brain')
+    args = ap.parse_args()
+
+    if args.list:
+        found = records()
+        if not found:
+            print('No running record yet. The first `bin/note` makes one.')
+            return 0
+        for r in found:
+            print(f"  {r['name']}  {r['title']}"
+                  + (f"  [{r['initiative']}]" if r['initiative'] else ''))
+        return 0
+
+    if args.review:
+        rows = review()
+        if not rows:
+            # These are different facts and the tool asserted the flattering
+            # one. With no notes record at all it reported that every entry
+            # had been promoted or deliberately left — a claim about a backlog
+            # that had never existed, from a tool built to make claims
+            # checkable. D0001's own target, in a tool three commits old.
+            if not records():
+                print('No notes record yet, so nothing has been captured this '
+                      'way.')
+                print('`bin/note "<what happened>"` opens one on first use.')
+                return 0
+            print('Nothing unclassified. Every entry has been promoted or left '
+                  'deliberately.')
+            return 0
+        print(f'{len(rows)} entry(ies) nobody has classified yet')
+        print()
+        for name, when, snippet in rows:
+            print(f'  {when}  {name}')
+            print(f'      {snippet}')
+        print()
+        print('  `bin/which` names the type for one of these, and prints the')
+        print('  `bin/new` command. Leaving an entry here is a real answer: a')
+        print('  journal line that never became a node still did its job the')
+        print('  day it was written.')
+        return 0
+
+    text = ' '.join(args.text).strip()
+    if not text:
+        if not sys.stdin.isatty():
+            text = sys.stdin.read().strip()
+        if not text:
+            print('Give the note: bin/note "what just happened"', file=sys.stderr)
+            return 1
+
+    record = pick(args.initiative)
+    made = False
+    if record is None or (args.initiative
+                          and record['initiative'] != args.initiative):
+        record = create(args.initiative)
+        made = True
+    if record is None:
+        return 1
+
+    append(record, text)
+    rel = os.path.relpath(record['path'], os.path.dirname(ROOT))
+    print(f'  {"opened and wrote" if made else "appended to"} {rel}')
+    print(f'  no type chosen. `bin/note --review` lists it; `bin/which` names')
+    print(f'  what it is when that question is worth answering.')
+    run([os.path.join(ROOT, 'bin', 'index')])
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

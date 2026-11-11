@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""Find what the brain already says about a proposed change.
+
+Usage:
+    brain/bin/relevant "add retrieval to the agent"
+    brain/bin/relevant --json "let the model choose the document path"
+    brain/bin/relevant --limit 12 "cache the eval results"
+
+Exit 0 always: having nothing to say about a change is an answer, not an error.
+
+This exists so that `/grill-change` is demonstrably reading the record rather
+than free-associating. A model asked to "consider the decisions" will produce
+something decision-shaped whether or not it looked; a model handed
+`0010-full-corpus-grounding.md` with a line number has been handed a fact it
+has to engage with. Every pushback the skill makes is supposed to cite one of
+these hits, and a reader can check the citation.
+
+No dependencies, same as the rest of brain/bin.
+
+## How it ranks
+
+Not a search engine. The corpus is ~90 files and the whole thing is read on
+every call, which takes milliseconds and avoids an index that could go stale —
+the failure this project keeps hitting.
+
+Scoring is deliberately crude and the weighting is the only opinionated part:
+a term in a **title** outranks the same term appearing twenty times in a body.
+A decision is titled with its claim ("The agent receives the whole corpus at a
+commit rather than retrieving from it"), so a title match usually means the
+document is *about* the thing being proposed, while a body match often means it
+merely mentions it in passing.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+SKIP_DIRS = {'bin', '.git', 'node_modules', 'templates', 'skills', 'example', 'handoff', 'feedback', 'docs', 'hooks'}
+
+# Weights. Title dominates on purpose; see the module docstring.
+W_TITLE = 10
+W_DESCRIPTION = 4
+W_TAG = 3
+W_BODY = 1
+
+# A term has to carry some signal. These appear in most of the corpus and
+# would match everything, which is the same as matching nothing.
+STOP = {
+    'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'our', 'out',
+    'how', 'why', 'what', 'when', 'where', 'can', 'should', 'would', 'add',
+    'make', 'change', 'changes', 'use', 'using', 'new', 'more', 'less', 'not',
+    'but', 'all', 'any', 'are', 'was', 'its', 'it', 'a', 'an', 'to', 'of',
+    'in', 'on', 'we', 'i', 'is', 'be', 'do', 'does', 'so', 'if', 'or',
+}
+
+# A tiebreak, not the sort. Ordering by kind first was the first version and it
+# was wrong in the way that matters: a query about retrieval filled every slot
+# with experiments and pushed out
+# `0010-full-corpus-grounding.md` — the decision titled "The agent receives the
+# whole corpus at a commit rather than retrieving from it", which is the single
+# entry the proposal contradicts. Relevance leads; kind breaks ties; and a cap
+# per kind keeps one loud family from crowding the rest out.
+KIND_ORDER = {
+    'evidence': 0,     # what was actually observed outranks what was intended
+    'decision': 1,
+    'principle': 1,
+    'goal': 2,
+    'task': 3,
+    'spec': 4,
+    'plan': 4,
+    'glossary': 5,
+}
+
+
+def frontmatter(text):
+    """The flat YAML the templates use. Same parser shape as bin/lint."""
+    if not text.startswith('---'):
+        return {}, text
+
+    end = text.find('\n---', 3)
+    if end == -1:
+        return {}, text
+
+    meta = {}
+    for line in text[3:end].split('\n'):
+        if ':' not in line or line.strip().startswith('#'):
+            continue
+        key, _, value = line.partition(':')
+        meta[key.strip()] = value.strip().strip('"\'')
+
+    return meta, text[end + 4:]
+
+
+def terms(query):
+    words = re.findall(r"[a-z0-9][a-z0-9_\-]*", query.lower())
+    return [w for w in dict.fromkeys(words) if len(w) > 2 and w not in STOP]
+
+
+def kind_of(path, meta):
+    """What sort of entry this is, for ordering and for the reader."""
+    declared = (meta.get('type') or '').strip()
+
+    # This used to sniff `/experiments/` and `/reference/` out of the path,
+    # because `context` covered a measurement and a stack fact alike and the
+    # ordering needed to tell them apart. D0002 named `evidence`, so the
+    # declared type is now enough.
+    return declared or 'untyped'
+
+
+def entries():
+    for base, dirs, files in os.walk(ROOT):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+
+        for name in sorted(files):
+            if not name.endswith('.md'):
+                continue
+
+            path = os.path.join(base, name)
+            rel = os.path.relpath(path, os.path.dirname(ROOT))
+
+            try:
+                text = open(path, encoding='utf-8').read()
+            except OSError:
+                continue
+
+            meta, body = frontmatter(text)
+            # Line numbers are for a reader opening the file, so they have to
+            # count the frontmatter. Reported against the body alone they were
+            # wrong by exactly the height of the head — close enough to look
+            # right and land you in the wrong paragraph, which is worse than
+            # no number at all.
+            head = text[:len(text) - len(body)]
+            yield rel, meta, body, head.count('\n') + 1
+
+
+def score(meta, body, wanted):
+    """Points, plus which terms actually hit — the second half is the useful one."""
+    title = (meta.get('title') or '').lower()
+    description = (meta.get('description') or '').lower()
+    tags = (meta.get('tags') or '').lower()
+    low = body.lower()
+
+    points = 0
+    hits = []
+
+    for term in wanted:
+        n = 0
+        if term in title:
+            n += W_TITLE
+        if term in description:
+            n += W_DESCRIPTION
+        if term in tags:
+            n += W_TAG
+
+        occurrences = low.count(term)
+        if occurrences:
+            # Capped. A term repeated forty times in one file is a file about
+            # that term, not a file forty times as relevant as its neighbour.
+            n += min(occurrences, 5) * W_BODY
+
+        if n:
+            points += n
+            hits.append(term)
+
+    return points, hits
+
+
+# Where a decision's own claim lives, best first. `# Context` is deliberately
+# last: it is where a decision states the position it is about to reject, so a
+# line lifted from it argues the opposite of the document it came from.
+CLAIM_SECTIONS = ['# Decision', '# Principle', '# Goal', '# Alternatives',
+                  '# Consequences', '# Implications']
+
+
+def _sections(body, base=1):
+    """Body split into (heading, text, first_line_number). 1-based.
+
+    The offset is carried so a quoted line can say where it is. An adopter
+    measured classification overhead down to ~5% and found the cost had not
+    gone away but **moved to retrieval** — and that the two scale differently:
+    classification is flat per item, retrieval grows with the record. Their ask
+    was exact: `bin/relevant` returning a line number. A path sends you to a
+    900-line evidence node; `path:412` is the citation this project keeps
+    saying it wants, and it is clickable in every terminal worth using.
+    """
+    out, current, buf = [], '', []
+    start = base
+    for n, line in enumerate(body.split('\n'), base):
+        if line.startswith('# '):
+            out.append((current, '\n'.join(buf), start))
+            current, buf, start = line.strip(), [], n + 1
+        else:
+            buf.append(line)
+    out.append((current, '\n'.join(buf), start))
+    return out
+
+
+def _first_line(text, term, offset=1):
+    """The quoted line, and the line number it sits on."""
+    for n, line in enumerate(text.split('\n')):
+        stripped = line.strip()
+        if term in stripped.lower() and len(stripped) > 20 \
+           and not stripped.startswith(('|', '>', '```')):
+            return (re.sub(r'\s+', ' ', stripped.lstrip('-* ')).strip()[:200],
+                    offset + n)
+    return None, None
+
+
+def line_for(body, term, meta=None, base=1):
+    """The line to quote — the document's claim, not its first keyword match.
+
+    This returned the first matching line in document order, which on a
+    template-shaped decision is inside `# Context`. A real case: a decision
+    titled "Voice skills govern human-facing prose only" was quoted as *"A
+    voice library could plausibly cover both"* — the position it exists to
+    reject — which read alone suggests the record is open to exactly what the
+    decision forbids. Ranking was right; the evidence inverted the answer.
+
+    `invariant:` is preferred over any body line: it is one sentence of what
+    must stay true, written for this purpose.
+    """
+    sections = _sections(body, base)
+    by_heading = {h: (t, n) for h, t, n in sections}
+
+    if meta:
+        inv = (meta.get('invariant') or '').strip()
+        if inv:
+            # The invariant lives in frontmatter, so its line is findable only
+            # by searching the raw head; `None` here means "no body line", and
+            # the caller prints the path alone rather than a wrong number.
+            return inv[:200], None
+
+    for heading in CLAIM_SECTIONS:
+        if heading in by_heading:
+            text, off = by_heading[heading]
+            hit, n = _first_line(text, term, off)
+            if hit:
+                return hit, n
+
+    # Anything but Context, then Context as the last resort — better a
+    # misleading quote than none, provided everything else has been tried.
+    for heading, text, off in sections:
+        if heading != '# Context':
+            hit, n = _first_line(text, term, off)
+            if hit:
+                return hit, n
+    text, off = by_heading.get('# Context', ('', 1))
+    return _first_line(text, term, off)
+
+
+def main():
+    ap = argparse.ArgumentParser(description='What the brain already says about a proposed change.')
+    ap.add_argument('query', nargs='+', help='the change, in your own words')
+    ap.add_argument('--limit', type=int, default=8)
+    ap.add_argument('--json', action='store_true')
+    args = ap.parse_args()
+
+    query = ' '.join(args.query)
+    wanted = terms(query)
+
+    if not wanted:
+        print('Nothing searchable in that. Describe the change in a few more words.', file=sys.stderr)
+        return 0
+
+    found = []
+
+    for rel, meta, body, base in entries():
+        points, hits = score(meta, body, wanted)
+
+        if points == 0:
+            continue
+
+        kind = kind_of(rel, meta)
+        found.append({
+            'path': rel,
+            'kind': kind,
+            'title': meta.get('title') or os.path.basename(rel),
+            'status': meta.get('status') or '',
+            'score': points,
+            'matched': hits,
+            'line': (line_for(body, hits[0], meta, base) if hits else (None, None))[0],
+            'lineno': (line_for(body, hits[0], meta, base) if hits else (None, None))[1],
+        })
+
+    found.sort(key=lambda e: (-e['score'], KIND_ORDER.get(e['kind'], 9)))
+
+    # At most three from any one kind before the next gets a look in. Seven
+    # experiments that all mention retrieval are one fact about the record,
+    # not seven things to answer for.
+    seen = {}
+    kept = []
+
+    for e in found:
+        n = seen.get(e['kind'], 0)
+        if n >= 3:
+            continue
+        seen[e['kind']] = n + 1
+        kept.append(e)
+
+    found = sorted(kept, key=lambda e: (KIND_ORDER.get(e['kind'], 9), -e['score']))[:args.limit]
+
+    if args.json:
+        dark, declaring, total = unreachable({e['path'] for e in found})
+        print(json.dumps({'query': query, 'terms': wanted, 'hits': found,
+                          'decisions': total, 'declaring_constrains': declaring,
+                          'unreachable': [{'id': i, 'title': t} for i, t in dark]},
+                         indent=2))
+        return 0
+
+    print(f'Brain hits for: {query}')
+    print(f'  matched on: {", ".join(wanted)}')
+    print()
+
+    if not found:
+        print('  Nothing. Either this is genuinely new ground, or it is described')
+        print('  in words the record does not use — try the domain term for it.')
+        # The backstop matters most here, and this branch returned before it:
+        # a search that found nothing is the one call where "what could this
+        # not surface" is the whole answer.
+        report_unreachable(set())
+        return 0
+
+    for e in found:
+        print(f"  [{e['kind']}] {e['title']}")
+        where = f"{e['path']}:{e['lineno']}" if e.get('lineno') else e['path']
+        print(f"      {where}{('  · ' + e['status']) if e['status'] else ''}")
+        if e['line']:
+            print(f"      “{e['line']}”")
+        print()
+
+    print('  Read these before arguing with them. A pushback that cites one of')
+    print('  these paths is checkable; one that does not is an opinion.')
+
+    report_unreachable({e['path'] for e in found})
+    return 0
+
+
+def unreachable(found_paths):
+    """Decisions this call could not surface, and the ones it did not need to.
+
+    `bin/relevant` used to print **every** decision on every call, as a
+    backstop against its own term matching: the docstring's example is a
+    proposal phrased "let the model choose which document to write to",
+    scoring nothing against a decision titled "utterances are bound, not
+    classified", which is the one decision it contradicts.
+
+    The backstop was honest and it does not scale. Seventeen titles is four
+    lines; eighty is a wall nobody reads, and it stops working exactly when the
+    record is big enough to need it (T0001). An adopter then measured the cost
+    and named the shape: classification is flat per item, **retrieval grows
+    with the record**.
+
+    So the backstop is narrowed to what it is actually for. A decision is
+    reachable three ways: this search matched it; it declares `constrains:` and
+    `bin/constraints <paths>` will find it; or **neither**, and nothing in this
+    toolchain can surface it against a change. Only the third group is printed,
+    because only it is a gap. It shrinks as the record improves and empties
+    when every decision declares what it governs, which is the state this was
+    always waiting for.
+    """
+    folder = os.path.join(ROOT, 'knowledge-catalog', 'decisions')
+    if not os.path.isdir(folder):
+        return [], 0, 0
+
+    dark, declaring, total = [], 0, 0
+    for name in sorted(os.listdir(folder)):
+        if not name.endswith('.md') or name == 'index.md':
+            continue
+        text = open(os.path.join(folder, name), encoding='utf-8').read()
+        meta, _ = frontmatter(text)
+        if meta.get('type') not in ('decision', 'principle'):
+            continue
+        total += 1
+
+        # `constrains:` is usually a block sequence, which the flat parser
+        # above reads as an empty string — the bug that once let `constrains:`
+        # govern nothing past a green lint. Ask the raw head instead.
+        head = text[:text.find('\n---', 3)]
+        governs = bool(re.search(r'^constrains:\s*(\S|\n\s+-\s)', head, re.M))
+        if governs:
+            declaring += 1
+            continue
+
+        rel = os.path.relpath(os.path.join(folder, name), os.path.dirname(ROOT))
+        if rel not in found_paths:
+            dark.append((name.split('-')[0], meta.get('title') or name))
+
+    return dark, declaring, total
+
+
+def report_unreachable(found_paths):
+    dark, declaring, total = unreachable(found_paths)
+    if not total:
+        return 0
+
+    silent = total - declaring
+    print()
+    if declaring:
+        print(f'  {declaring} of {total} decision(s) declare `constrains:`, so')
+        print('  `bin/constraints <the paths this change touches>` finds them by')
+        print('  lookup rather than by word. Run it — this search cannot.')
+        print()
+    if silent:
+        # Stated, not implied. A decision with no `constrains:` can never match
+        # a diff, whatever anyone does, and that is a fact about the record
+        # worth seeing on every call.
+        verb = 'declares' if silent == 1 else 'declare'
+        print(f'  {silent} {verb} none, and so can never match a diff.')
+        print()
+
+    if not dark:
+        print('  Nothing is hidden: every decision either matched this search')
+        print('  or declares what it governs.')
+        return 0
+
+    print(f'  {len(dark)} decision(s) matched neither this search nor any path,')
+    print('  so no tool here can surface them against a change. The record uses')
+    print('  its own vocabulary; scan these yourself:')
+    print()
+    for number, title in dark[:12]:
+        print(f'    {number}  {title}')
+    if len(dark) > 12:
+        print(f'    … and {len(dark) - 12} more')
+    print()
+    print('  Each one that gains a `constrains:` leaves this list for good.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

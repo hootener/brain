@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Print the task table and the claimable frontier for brain/tasks.
+
+Usage: brain/bin/status [initiative] [--json]
+No dependencies: the frontmatter parser handles the flat YAML the task template uses.
+"""
+import json, os, re, sys
+from datetime import datetime, timezone, timedelta
+
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tasks')
+# Testing counts as done for the frontier: the code is on the branch, which is
+# what a dependent task in the same initiative actually needs.
+# Superseded counts as done for the frontier in the one sense that matters to
+# a dependent task: nobody is going to do it. Whether its dependents still
+# make sense is a question for a person — /audit asks it rather than guessing.
+DONE = {'Testing', 'Complete', 'Delivered', 'Superseded'}
+CLAIM_TTL = timedelta(hours=1)
+
+def parse_front(text):
+    m = re.match(r'^---\n(.*?)\n---\n', text, re.S)
+    if not m:
+        return {}
+    out, key = {}, None
+    for line in m.group(1).splitlines():
+        # YAML block-list item, e.g. a multi-line blocked_by. The flat parser
+        # this was ported with skipped these, so every task read as unblocked
+        # and the frontier was every task.
+        if re.match(r'^\s+-\s', line) and key:
+            out.setdefault(key, [])
+            if isinstance(out[key], list):
+                out[key].append(line.strip()[2:].strip().strip('"\''))
+            continue
+        if ':' not in line or line.startswith(' '):
+            continue
+        k, v = line.split(':', 1)
+        key, v = k.strip(), v.strip()
+        if v.startswith('[') and v.endswith(']'):
+            v = [x.strip().strip('"\'') for x in v[1:-1].split(',') if x.strip()]
+        elif v == '':
+            v = []
+        else:
+            v = v.strip('"\'')
+        out[key] = v
+    return out
+
+def _label(blocker):
+    """A task blocker shows its id; a plan blocker shows which initiative.
+
+    The id is the first five characters of the filename (`T0007`). Applying
+    that to a `plan:formalize` label chopped it to `plan:`, which named
+    nothing — found the first time a plan blocker was tested.
+    """
+    if blocker.startswith('plan:'):
+        return blocker
+    return blocker.split('/')[-1][:5]
+
+
+def plan_initiative(ROOT, rel):
+    """The initiative a plan node names, for a `blocked_by` that points at one."""
+    path = os.path.normpath(os.path.join(ROOT, '..', rel))
+    try:
+        text = open(path).read()
+    except OSError:
+        return None
+    m = re.search(r'^initiative:\s*(.+)$', text[:text.find('\n---', 3)], re.M)
+    return m.group(1).strip().strip('"\'') if m else None
+
+
+def load(initiative=None):
+    tasks = []
+    for folder in sorted(os.listdir(ROOT)):
+        d = os.path.join(ROOT, folder)
+        if not os.path.isdir(d) or (initiative and folder != initiative):
+            continue
+        for f in sorted(os.listdir(d)):
+            if not re.match(r'^T\d{4}-.*\.md$', f):
+                continue
+            path = os.path.join(d, f)
+            fm = parse_front(open(path).read())
+            if fm.get('type') != 'task':
+                continue
+            fm['_path'] = os.path.relpath(path, os.path.join(ROOT, '..'))
+            fm['_key'] = f'{folder}/{f}'
+            # A blocker is a node (D0008): another task, or a whole plan,
+            # which resolves as every task under that plan's initiative.
+            fm['_blockers'], fm['_plan_blockers'] = [], []
+            for b in (fm.get('blocked_by') or []):
+                target = os.path.normpath(os.path.join(folder, b))
+                if '/plans/' in target.replace(os.sep, '/') or target.startswith('..'):
+                    fm['_plan_blockers'].append(
+                        os.path.normpath(os.path.join('tasks', folder, b)))
+                else:
+                    fm['_blockers'].append(target)
+            tasks.append(fm)
+    return tasks
+
+def last_journal(initiative, worker):
+    p = os.path.join(ROOT, '..', 'work', initiative, f'{worker}.md')
+    return datetime.fromtimestamp(os.path.getmtime(p), timezone.utc) if os.path.exists(p) else None
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    tasks = load(args[0] if args else None)
+    by_key = {t['_key']: t for t in tasks}
+    now = datetime.now(timezone.utc)
+    rows, frontier = [], []
+    all_tasks = load() if any(t['_plan_blockers'] for t in tasks) else tasks
+    by_initiative = {}
+    for t in all_tasks:
+        by_initiative.setdefault(t.get('initiative', ''), []).append(t)
+
+    for t in tasks:
+        blockers = t['_blockers']
+        open_blockers = [b for b in blockers if by_key.get(b, {}).get('status') not in DONE]
+
+        # A plan blocker clears only when its initiative has tasks and all of
+        # them are done. A plan with none is not finished — nothing started is
+        # not the same as nothing left.
+        for rel in t['_plan_blockers']:
+            init = plan_initiative(ROOT, rel)
+            group = by_initiative.get(init, [])
+            if not group or any(x.get('status') not in DONE for x in group):
+                open_blockers.append(f'plan:{init or "?"}')
+        claimant = t.get('claimed_by') or ''
+        stale = ''
+        if claimant:
+            lj = last_journal(t.get('initiative', ''), claimant)
+            if lj is None or now - lj > CLAIM_TTL:
+                stale = ' (stale)'
+        takeable = t.get('status') == 'Ready for Development' and not claimant and not open_blockers and not t.get('wontfix')
+        if takeable:
+            frontier.append(t)
+        rows.append((t['_key'], t.get('status', '?') + (' [wontfix]' if t.get('wontfix') else ''), claimant + stale,
+                     ', '.join(_label(b) for b in open_blockers) or '-', t.get('title', '')))
+    if '--json' in sys.argv:
+        print(json.dumps([{k: v for k, v in t.items() if not k.startswith('_')} | {'path': t['_path']} for t in tasks], indent=2))
+        return
+    if not rows:
+        print('no tasks found'); return
+    w = [max(len(str(r[i])) for r in rows + [('task', 'status', 'claimed by', 'waits on', 'title')]) for i in range(5)]
+    fmt = '  '.join('{:<%d}' % n for n in w)
+    print(fmt.format('task', 'status', 'claimed by', 'waits on', 'title'))
+    for r in rows:
+        print(fmt.format(*r))
+    print()
+    print('frontier (claimable now): ' + (', '.join(t['_key'] for t in frontier) or 'nothing'))
+
+if __name__ == '__main__':
+    main()

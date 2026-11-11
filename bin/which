@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Answer "what kind of node is this?" in under a minute.
+
+Usage:
+    brain/bin/which                 # ask me the questions
+    brain/bin/which --table         # the whole procedure at once
+    brain/bin/which --why evidence  # what that type is for, and is not
+
+Exit 0 always: "it is not a node" is an answer.
+
+## Why this exists
+
+An adopter measured the brain's overhead at 15-25% per change and located it
+precisely:
+
+> Writing is cheap, choosing the category is the cost and has no tool.
+
+Seven types, most of them wrong for any given thing, and the choice taken
+while something is still happening. Every other decision in this brain has a
+tool — `bin/new` allocates the id, `bin/lint` checks the shape,
+`bin/constraints` finds what governs it — and the one made most often had
+none.
+
+## How it decides
+
+Questions ordered by **what it costs to get them wrong**, not by how often
+each answer is right.
+
+The first version asked "has it already happened — observed, measured, or
+*told to you*?" and put it first on frequency grounds. On consulting work that
+mis-sorts the most important case there is: a client's scope decision is
+something you were told, so it typed as evidence — and `bin/constraints` only
+works on it because it is filed as a decision. Filing a decision as evidence
+is silent and expensive; the thing never surfaces against a diff again. Filing
+evidence as a decision is noisy and cheap.
+
+So the binding test goes first, and it no longer presupposes that *you* were
+the one who chose.
+
+It never reads your text. D0011 is explicit that inferring what the adopter's
+content means is the failure class behind every semantic defect found so far,
+and a wrong type is worse than no type, because a typed node looks decided.
+You answer; this only knows the order to ask in.
+"""
+import argparse
+import sys
+
+# (key, question, type, why)
+LADDER = [
+    ('binds',
+     'Does it bind future work — a choice someone made, yours or a client\'s, '
+     'that a later change could violate?',
+     'decision',
+     'The test is the violation, not who chose and not how important it felt. '
+     'A client setting a cancellation window on a Monday evening is a '
+     'decision, even though you were told it rather than choosing it. Give it '
+     'an `invariant:` — one sentence a change could break — and `constrains:` '
+     'paths, or no tool will ever surface it against a diff.'),
+    ('happened',
+     'Has it already happened — observed, measured, told to you, or returned '
+     'by a run — and binds nothing going forward?',
+     'evidence',
+     'The largest category in most real brains and the one people reach for '
+     'last. A measurement, a retro, a thing that broke, a client email that '
+     'reports rather than decides. It does not have to be quantitative.'),
+    ('always',
+     'Is it a rule that holds across cases rather than one choice on one day?',
+     'principle',
+     'Rare and worth being stingy with. A principle you would not enforce is '
+     'a decision you have not made.'),
+    ('work',
+     'Is it a unit of work somebody could pick up and finish?',
+     'task',
+     'Including an open question that blocks work — that is a task with '
+     '`category: question` (D0009), not a new type.'),
+    ('outcome',
+     'Is it an outcome you want, that you could later ask whether you reached?',
+     'goal',
+     'Goals are few. If you cannot say what would show it was reached, it is '
+     'not a goal yet.'),
+    ('shape',
+     'Is it the shape of a thing not yet built — interfaces, behaviour, '
+     'acceptance?',
+     'spec',
+     'A spec says what the thing is; a plan says in what order it gets built. '
+     'Both name the goal or decision they serve with `serves:`.'),
+    ('sequence',
+     'Is it the sequence of work for an initiative not yet done?',
+     'plan',
+     'If your intent arrives from outside as prose — consulting, client work '
+     '— you may legitimately have none of these. A task may serve a decision '
+     'directly.'),
+]
+
+FOLDER = {
+    'evidence': 'knowledge-catalog/reference/',
+    'decision': 'knowledge-catalog/decisions/',
+    'principle': 'knowledge-catalog/decisions/',
+    'goal': 'knowledge-catalog/goals/',
+    'spec': 'knowledge-catalog/specs/',
+    'plan': 'plans/<initiative>/',
+    'task': 'tasks/<initiative>/',
+}
+
+
+def verdict(kind):
+    print()
+    print(f'  → {kind}')
+    print(f'    {FOLDER[kind]}')
+    print()
+    extra = ' --initiative <name>' if kind in ('task', 'plan') else ''
+    print(f'    bin/new {kind} "<title>"{extra}')
+    print()
+    for key, _, t, why in LADDER:
+        if t == kind:
+            print(f'    {why}')
+            break
+    print()
+    return 0
+
+
+def no_node():
+    print()
+    print('  → not a node, at least not yet')
+    print()
+    print('    bin/note "<what happened>"')
+    print()
+    print('    It lands dated and untyped in the running record, and')
+    print('    `bin/note --review` lists it when the question is worth')
+    print('    answering. Leaving it there is a real answer: an adopter')
+    print('    reported that an append-only journal was the single part of')
+    print('    the brain that earned its keep, and none of those lines were')
+    print('    typed nodes.')
+    print()
+    return 0
+
+
+def table():
+    print('What kind of node is this? First yes wins.')
+    print()
+    for n, (key, q, kind, why) in enumerate(LADDER, 1):
+        print(f'  {n}. {q}')
+        print(f'     → {kind}  ({FOLDER[kind]})')
+        print()
+    print('  No to all seven → not a node. `bin/note "<what happened>"`.')
+    print()
+    print('  Two rules that save most of the agonising:')
+    print()
+    print('  · **When two fit, take the earlier question.** They are ordered')
+    print('    by what it costs to get them wrong. A decision filed as')
+    print('    evidence never surfaces against a diff again; evidence filed')
+    print('    as a decision is merely noisy.')
+    print('  · **When none clearly fits, do not force one.** A wrong type is')
+    print('    worse than no type, because a typed node looks decided. Note')
+    print('    it and move on; the shape is usually obvious a week later.')
+    return 0
+
+
+def ask(supplied=None):
+    """Walk the ladder. Answers come from argv, from stdin, or from a prompt.
+
+    This only ever prompted, and fell back to printing the whole table
+    whenever stdin was not a tty — so **an agent could never reach the
+    ladder**, which is the part that resolves a type in two questions instead
+    of seven. The main caller of every tool here is an agent, and the one path
+    built for a human was the only path that worked.
+
+    Found by an adopter who had to drive it through a pty to test it at all.
+    """
+    answers = list(supplied or [])
+    if answers:
+        print('Answers supplied: ' + ' '.join(answers))
+    else:
+        print('Answer y/n. First yes wins; ctrl-c is also an answer.')
+    print()
+
+    for key, q, kind, why in LADDER:
+        if answers:
+            raw = answers.pop(0).strip().lower()
+            print(f'  {q} [y/N] {raw}')
+        else:
+            try:
+                raw = input(f'  {q} [y/N] ').strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                print('  (no more answers)')
+                return no_node()
+        if raw.startswith('y'):
+            return verdict(kind)
+    return no_node()
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description='What kind of node is this?')
+    ap.add_argument('answers', nargs='*', metavar='y|n',
+                    help='answers to the questions, in order — so an agent can '
+                         'resolve a type in one call: bin/which n y')
+    ap.add_argument('--table', action='store_true',
+                    help='the whole procedure at once')
+    ap.add_argument('--why', metavar='TYPE',
+                    help='what that type is for, and is not')
+    args = ap.parse_args()
+
+    if args.why:
+        for key, q, kind, why in LADDER:
+            if kind == args.why:
+                print(f'{kind} — {FOLDER[kind]}')
+                print()
+                print(f'  ask: {q}')
+                print(f'  {why}')
+                return 0
+        print(f'Unknown type `{args.why}`. One of: '
+              + ', '.join(sorted(FOLDER)), file=sys.stderr)
+        return 0
+
+    if args.table:
+        return table()
+
+    answers = [a for a in args.answers if a.lower() in
+               ('y', 'n', 'yes', 'no')]
+    if args.answers and not answers:
+        print('Answers are y or n: bin/which n y', file=sys.stderr)
+        return 0
+    if not answers and not sys.stdin.isatty():
+        # Piped answers, one per line. Only the table when there is genuinely
+        # nothing to read, which is the honest fallback rather than the
+        # universal one.
+        piped = [l.strip() for l in sys.stdin.read().split('\n') if l.strip()]
+        answers = [a for a in piped if a.lower() in ('y', 'n', 'yes', 'no')]
+        if not answers:
+            return table()
+    return ask(answers)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

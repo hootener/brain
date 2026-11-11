@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+"""Build brain/graph.html: a browser-only graph of every markdown file in brain.
+
+Nodes are files (titled by relative path), edges are markdown links between
+them, colours follow the frontmatter `status`. Re-run after editing brain.
+"""
+import json
+import os, re, sys
+from datetime import datetime, timezone
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+OUT = os.path.join(ROOT, 'graph.html')
+# The page title: the project folder that holds brain/, so a template copy names itself.
+NAME = os.path.basename(os.path.dirname(ROOT))
+# `templates` holds the OKF files other documents are started from. They are
+# valid markdown with real frontmatter, so they used to appear as nodes — a
+# template task rendering as a Not Ready ticket. They are patterns, not
+# knowledge, so they are not part of the graph. The linter still checks them.
+SKIP_DIRS = {'bin', '.git', 'node_modules', 'templates', 'skills', 'example', 'handoff', 'feedback', 'docs', 'hooks'}
+
+def parse_front(text):
+    m = re.match(r'^---\n(.*?)\n---\n?', text, re.S)
+    if not m:
+        return {}, text
+    fm, body = {}, text[m.end():]
+    key = None
+    for line in m.group(1).splitlines():
+        if re.match(r'^\s+-\s', line) and key:          # yaml list item
+            fm.setdefault(key, [])
+            if isinstance(fm[key], list):
+                fm[key].append(line.strip()[2:].strip().strip('"\''))
+            continue
+        if ':' not in line or line.startswith(' '):
+            continue
+        k, v = line.split(':', 1); key = k.strip(); v = v.strip()
+        if v.startswith('[') and v.endswith(']'):
+            v = [x.strip().strip('"\'') for x in v[1:-1].split(',') if x.strip()]
+        elif v == '':
+            v = []
+        else:
+            v = v.strip('"\'')
+        fm[key] = v
+    return fm, body
+
+def collect():
+    files = {}
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for f in filenames:
+            if f.endswith('.md'):
+                p = os.path.join(dirpath, f)
+                rel = os.path.relpath(p, ROOT)
+                text = open(p, encoding='utf-8').read()
+                fm, body = parse_front(text)
+                files[rel] = {'path': rel, 'meta': fm, 'body': body, 'raw': text,
+                              'mtime': datetime.fromtimestamp(os.path.getmtime(p), timezone.utc).isoformat(timespec='seconds')}
+    return files
+
+LINK_RE = re.compile(r'\[[^\]]*\]\(([^)\s]+)\)|\[\[([^\]|]+)(?:\|[^\]]*)?\]\]')
+
+def edges_for(rel, body, files, meta=None):
+    out = set()
+    base = os.path.dirname(rel)
+    names = {os.path.splitext(os.path.basename(p))[0]: p for p in files}
+    # Frontmatter paths (blocked_by, spec) are relative markdown links too.
+    extra = []
+    for k in ('blocked_by', 'spec'):
+        v = (meta or {}).get(k)
+        extra += v if isinstance(v, list) else ([v] if v else [])
+    found = [(m.group(1) or m.group(2), bool(m.group(2))) for m in LINK_RE.finditer(body)] + [(e, False) for e in extra]
+    for target, wiki in found:
+        if not target or target.startswith(('http://', 'https://', 'mailto:', '#')):
+            continue
+        target = target.split('#')[0]
+        if wiki:  # wikilink by name
+            hit = names.get(target.strip())
+            if hit: out.add(hit)
+            continue
+        cand = os.path.normpath(os.path.join(base, target))
+        if cand in files:
+            out.add(cand)
+        elif cand + '.md' in files:
+            out.add(cand + '.md')
+    out.discard(rel)
+    return sorted(out)
+
+GENERATED = re.compile(r'"generated":\s*"[^"]*"')
+MTIME = re.compile(r'"mtime":\s*"[^"]*"')
+NAMED = re.compile(r'<(title|h1)>[^<]*</\1>')
+
+
+def strip_generated(html):
+    """The bytes that change without the graph changing.
+
+    The build stamp is the obvious one. The per-node `mtime` is the one that
+    cost a working CI: it is read from the filesystem, and `git clone` stamps
+    every file with the moment of checkout. So the committed graph could only
+    ever match on the machine that built it, and `--check` failed on every
+    fresh clone -- which is every CI run, for every adopter. mtime is shown
+    in the node panel and is not structural, so comparison ignores it.
+    """
+    return MTIME.sub('"mtime": ""', GENERATED.sub('"generated": ""', html))
+
+
+def strip_unportable(html):
+    """What `--check` must also ignore, on top of the clock and the mtimes.
+
+    The name is `<parent dir> · brain`, written into both the title and the
+    header, and it is the project name for an
+    embedded install and is the point of it. It is also wherever the brain
+    happens to sit, so a checkout at /home/runner/work/brain/brain and one at
+    ~/Source/brain disagree about a file neither of them changed. `--check`
+    is the CI step, so it asks whether the graph reflects the nodes, not
+    where it was built. The write path still rewrites on a title change, so
+    an adopter's own graph takes their project's name as soon as it rebuilds.
+    """
+    return NAMED.sub(lambda m: f'<{m.group(1)}></{m.group(1)}>',
+                      strip_generated(html))
+
+
+def main():
+    files = collect()
+    nodes, links = [], []
+    for rel, f in sorted(files.items()):
+        f['links'] = edges_for(rel, f['body'], files, f['meta'])
+        nodes.append({k: f[k] for k in ('path', 'meta', 'body', 'mtime')})
+        for t in f['links']:
+            links.append({'source': rel, 'target': t})
+    data = {'generated': datetime.now(timezone.utc).isoformat(timespec='seconds'), 'nodes': nodes, 'links': links}
+    html = TEMPLATE.replace('__DATA__', json.dumps(data).replace('</', '<\\/'))
+    html = html.replace('__BRAIN_NAME__', NAME)
+
+    # `--check` answers "is the committed graph current?" without writing, which
+    # is what CI needs. A plain rebuild-and-diff cannot answer it: every build
+    # stamps a fresh `generated` time, the whole payload sits on one line, and
+    # git therefore reports the file as changed every single run. The check
+    # would have failed on every commit forever while looking like a real
+    # finding. So compare everything *except* the timestamp.
+    if '--check' in sys.argv:
+        if not os.path.exists(OUT):
+            print('graph.html has never been built', file=sys.stderr)
+            return 1
+        current = open(OUT, encoding='utf-8').read()
+        if strip_unportable(current) == strip_unportable(html):
+            print(f'graph.html is current: {len(nodes)} nodes, {len(links)} edges')
+            return 0
+        print('graph.html is out of date — run `bin/graph-build` and commit it',
+              file=sys.stderr)
+        return 1
+
+    # Don't rewrite a file whose only difference is the clock. `--check` has
+    # always compared modulo the timestamp; the write path never asked, so
+    # every run rewrote the graph and three separate symptoms followed from
+    # it: `bin/prove`'s idempotence assertion became a coin flip, `bin/update`
+    # reported churn it had not caused, and `bin/adopt` silently rewrote
+    # graph.html on a second run — which is how a fourth adopter's very first
+    # `bin/prove` invocation failed.
+    #
+    # Twice I treated the symptom instead of this line.
+    if os.path.exists(OUT):
+        current = open(OUT, encoding='utf-8').read()
+        if strip_generated(current) == strip_generated(html):
+            print(f'{os.path.relpath(OUT)} already current: '
+                  f'{len(nodes)} nodes, {len(links)} edges')
+            return 0
+
+    open(OUT, 'w', encoding='utf-8').write(html)
+    print(f'wrote {os.path.relpath(OUT)}: {len(nodes)} nodes, {len(links)} edges')
+    return 0
+
+TEMPLATE = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAIN_NAME__ · brain</title>
+<style>
+/* Console palette. Cyan is the chrome accent because every other terminal
+   colour is already spoken for by a status ring — yellow is draft, amber is
+   In Progress, blue is Ready, green is Complete. */
+:root{--bg:#f3f3f1;--panel:#fbfbfa;--chrome:#eceeef;--ink:#16181d;--muted:#6b7280;--line:#d2d5da;--edge:#bdc2c9;--accent:#0e7490;
+      --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--panel:#141922;--chrome:#0a0e14;--ink:#d7dde5;--muted:#7d8795;--line:#232a35;--edge:#2b3341;--accent:#22d3ee}}
+*{box-sizing:border-box}html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+#app{display:grid;grid-template-rows:auto 1fr;height:100%}
+/* Two fixed rows: controls, then legend. Neither wraps — the legend scrolls
+   sideways instead, which is what the old single flex row did badly. */
+header{background:var(--chrome);border-bottom:1px solid var(--line);font-family:var(--mono)}
+.bar{display:flex;align-items:center;gap:14px;padding:7px 12px;white-space:nowrap}
+header h1{font-size:12px;margin:0;font-weight:600;letter-spacing:.02em;color:var(--ink)}
+header h1::before{content:'▸ ';color:var(--accent)}
+header .meta{color:var(--muted);font-size:11px;letter-spacing:.01em}
+.spacer{margin-left:auto}
+
+/* [ ] / [x] instead of a native checkbox — cheap, and it reads as a console. */
+.toggle{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);cursor:pointer;user-select:none}
+.toggle input{position:absolute;opacity:0;width:0;height:0}
+.toggle::before{content:'[ ]';font-family:var(--mono);letter-spacing:-.5px}
+.toggle:has(input:checked){color:var(--accent)}
+.toggle:has(input:checked)::before{content:'[x]'}
+.toggle:has(input:disabled){opacity:.35;cursor:default}
+.toggle:not(:has(input:disabled)):hover{color:var(--ink)}
+
+#searchwrap{position:relative;display:inline-flex;align-items:center}
+#searchwrap::before{content:'/';position:absolute;left:8px;color:var(--accent);font-family:var(--mono);font-size:12px;pointer-events:none}
+#search{font-family:var(--mono);font-size:11.5px;padding:5px 24px 5px 19px;border:1px solid var(--line);border-radius:0;background:var(--bg);color:var(--ink);width:300px}
+#search:focus{outline:none;border-color:var(--accent)}
+#search::placeholder{color:var(--muted);opacity:.7}
+#clear{position:absolute;right:4px;width:15px;height:15px;padding:0;border:0;border-radius:0;background:transparent;color:var(--muted);font-family:var(--mono);font-size:13px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center}
+#clear:hover{color:var(--accent)}
+/* display:flex above beats the hidden attribute's display:none, so the
+   clear button was showing with nothing to clear. */
+#clear[hidden]{display:none}
+#matches{min-width:62px;text-align:right}
+
+/* One row per group, stacked. Twenty entries on one line overflowed at any
+   realistic width; each group fits comfortably on its own, and still scrolls
+   sideways rather than reflowing if the window gets very narrow. */
+#legend{display:flex;flex-direction:column;align-items:flex-start;gap:2px;padding:0 12px 6px;font-size:10.5px;color:var(--muted)}
+#legend span{display:inline-flex;align-items:center;gap:4px}
+#legend i{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+#legend i.ring{background:transparent;border:2px solid var(--line);box-sizing:border-box}
+.legend-group{display:flex;align-items:center;gap:8px;white-space:nowrap;max-width:100%;overflow-x:auto;scrollbar-width:thin}
+.legend-group::-webkit-scrollbar{height:4px}
+.legend-group::-webkit-scrollbar-thumb{background:var(--line)}
+/* Fixed label column so the swatches line up between the two rows. */
+.legend-group b.key{flex:none;width:auto;color:var(--accent);font-weight:600;letter-spacing:0;text-transform:none;font-size:inherit;opacity:1}
+.legend-group>b{flex:none;width:56px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-size:9.5px;opacity:.8}
+#stage{position:relative;overflow:hidden}svg{width:100%;height:100%;display:block;cursor:grab}svg:active{cursor:grabbing}
+.link{stroke:var(--edge);stroke-width:1.2;fill:none;marker-end:url(#arrow)}
+.node circle{stroke:var(--bg);stroke-width:1.5}
+.node.selected circle{stroke:var(--accent)!important;stroke-width:3px!important;stroke-dasharray:none!important}
+.node text{font-family:var(--mono);font-size:9.5px;fill:var(--ink);pointer-events:none;paint-order:stroke;stroke:var(--bg);stroke-width:3px;stroke-linejoin:round}
+.node.dim{opacity:.18}.link.dim{opacity:.08}
+#panel{position:absolute;top:0;right:0;height:100%;width:min(560px,92vw);background:var(--panel);border-left:1px solid var(--line);box-shadow:-8px 0 24px rgba(0,0,0,.12);transform:translateX(100%);transition:transform .22s ease;display:flex;flex-direction:column}
+#panel.open{transform:none}
+#panel .top{padding:18px 20px 14px;border-bottom:1px solid var(--line)}
+#panel .top .path{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted);word-break:break-all}
+#panel .top h2{margin:6px 0 10px;font-size:18px;line-height:1.25}
+#panel .top .path,#panel .chips,#panel .kv,#hint,.chip{font-family:var(--mono)}
+#panel .chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:2px 7px;border-radius:0;font-size:11px;background:var(--bg);border:1px solid var(--line)}
+.chip b{font-weight:600}.chip.status{color:#fff;border-color:transparent}
+.chip--tag,.chip--filter{cursor:pointer}
+.chip--tag:hover,.chip--filter:hover{border-color:var(--accent);color:var(--accent)}
+.chip.status.chip--filter:hover{color:#fff;border-color:var(--ink)}
+.legend-group b.cat{flex:none;color:var(--ink);opacity:.75;font-weight:700;
+text-transform:uppercase;letter-spacing:.06em;font-size:9px;cursor:pointer;
+padding:1px 3px;border-radius:3px;margin-left:6px}
+.legend-group b.cat:first-of-type{margin-left:0}
+.legend-group b.cat:hover{background:var(--bg);opacity:1}
+.legend-group span[data-filter]{cursor:pointer;padding:1px 3px;border-radius:3px}
+.legend-group span[data-filter]:hover{background:var(--bg);color:var(--ink)}
+header #matches{min-width:72px;text-align:right}
+#panel .kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin-top:12px;font-size:12px}
+#panel .kv dt{color:var(--muted)}#panel .kv dd{margin:0;word-break:break-word}#panel .kv a{color:var(--accent)}
+#panel .kv a.internal{text-decoration:underline dotted;cursor:pointer}
+#panel .kv details.linkgrp{display:inline-block;margin-right:14px;vertical-align:top}
+#panel .kv details.linkgrp li{display:flex;align-items:baseline;gap:6px}
+/* The dot is the node's own fill, so a link reads the same way the graph does. */
+#panel .kv .ldot{flex:0 0 auto;width:7px;height:7px;border-radius:50%;display:inline-block;transform:translateY(-1px)}
+/* A task's status, bordered rather than filled: it sits beside a link and must
+   not compete with it for the eye. */
+#panel .kv .lstatus{flex:0 0 auto;font-style:normal;font-size:9px;letter-spacing:.04em;
+  text-transform:uppercase;border:1px solid;border-radius:2px;padding:0 3px;opacity:.85}
+#panel .kv details.linkgrp>summary{cursor:pointer;color:var(--accent);list-style:none;display:inline-block}
+#panel .kv details.linkgrp>summary::-webkit-details-marker{display:none}
+#panel .kv details.linkgrp>summary::before{content:'\25b8';font-size:9px;margin-right:4px;display:inline-block}
+#panel .kv details.linkgrp[open]>summary::before{content:'\25be'}
+/* The coloured dot *is* the bullet now. A disc beside it would be two markers
+   doing one job, and the second one carries no information. */
+#panel .kv details.linkgrp ul{margin:6px 0 2px;padding:0 0 0 2px;list-style:none}
+#panel .kv details.linkgrp li{margin:3px 0;line-height:1.4}
+#panel .kv details.linkgrp li::marker{color:var(--muted)}
+/* A dozen dotted-underlined links in a column reads as a wall. Bullets carry
+   the list structure, so the links drop their underline until hovered. */
+#panel .kv details.linkgrp li a{text-decoration:none}
+#panel .kv details.linkgrp li a:hover{text-decoration:underline}
+#panel .kv .muted{color:var(--muted);margin-right:14px}
+#panel .close{position:absolute;top:12px;right:12px;border:0;background:transparent;font-size:20px;color:var(--muted);cursor:pointer}
+#panel .body{padding:16px 20px;overflow:auto;flex:1}
+.md h1,.md h2,.md h3{margin:18px 0 8px;line-height:1.25}.md h1{font-size:18px}.md h2{font-size:15px}.md h3{font-size:14px}
+.md p,.md li{font-size:13.5px}.md code{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:var(--bg);padding:1px 4px;border-radius:4px}
+.md pre{background:var(--bg);padding:10px;border-radius:6px;overflow:auto}.md pre code{background:none;padding:0}
+.md table{border-collapse:collapse;font-size:12.5px}.md th,.md td{border:1px solid var(--line);padding:4px 8px;text-align:left}
+.md a{color:var(--accent)}.md a.internal{text-decoration:underline dotted}
+.md input[type=checkbox]{margin-right:6px}
+#hint{position:absolute;left:12px;bottom:10px;font-size:10px;color:var(--muted);opacity:.8;font-family:var(--mono)}
+#hint b{color:var(--accent);font-weight:600}
+</style></head><body><div id="app">
+<header><div class="bar"><h1>__BRAIN_NAME__ · brain</h1><span class="meta" id="meta"></span><span class="spacer"></span><label class="toggle" title="Remove filtered-out nodes so the rest re-lays-out"><input type="checkbox" id="focus">focus</label><label class="toggle" title="Also keep what the matches link to"><input type="checkbox" id="linked" disabled>linked</label><span id="searchwrap"><input id="search" placeholder="path · title · #tag · @type"><button id="clear" type="button" title="Clear filter (Esc)" aria-label="Clear filter" hidden>&times;</button></span><span class="meta" id="matches"></span></div><div id="legend"></div></header>
+<div id="stage"><svg><defs><marker id="arrow" viewBox="0 -5 10 10" refX="18" refY="0" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,-5L10,0L0,5" fill="var(--edge)"></path></marker></defs><g id="view"></g></svg>
+<div id="hint">scroll zoom · drag pan · drag node to pin · click node for details · dbl-click bg to reset · press a <b>[key]</b> to filter · esc clears</div>
+<aside id="panel"><button class="close" title="Close">×</button><div class="top"></div><div class="body md"></div></aside></div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script>
+const DATA = __DATA__;
+// Two independent channels, because these are two independent facts.
+//
+//   FILL   = what kind of document this is (type)
+//   RING   = where it stands (status)
+//
+// They used to share one channel: colorOf was STATUS_COLORS[status] ||
+// TYPE_COLORS[type], so the same colour meant status on a node that had one and
+// type on a node that did not — and `active` and `spec` were even the same hex.
+//
+// Fills are deliberately muted: type is categorical and does not need to shout.
+// Rings are saturated, because status is what you scan a graph for.
+// Grouped by the four categories of D0002, in left-to-right order, so the
+// legend reads as the model rather than as an alphabet. `bin/diagram` paints
+// docs/lineage.svg from these same hexes; a mismatch between the two is a
+// drift the README would show and nobody would notice.
+const TYPE_FILL = {
+  goal:                 '#a5d6a7',   // Intent
+  decision:             '#b39ddb',
+  principle:            '#f0a8c0',
+  plan:                 '#f5bd8f',   // Approach
+  spec:                 '#9ecbe8',
+  task:                 '#aebdd4',   // Action
+  evidence:             '#9fd8cf',   // Evidence (was `context`, D0002)
+  glossary:             '#e6d08a',   // outside the four: definitional
+};
+// The four categories of D0002, in left-to-right order. One source for the
+// legend's grouping and for the `@intent` family of filters, so the picture
+// and the search cannot disagree about what a category contains.
+const CATEGORY = {
+  intent:   ['goal', 'decision', 'principle'],
+  approach: ['plan', 'spec'],
+  action:   ['task'],
+  evidence: ['evidence'],
+};
+const CATEGORY_OF = {};
+for (const [cat, types] of Object.entries(CATEGORY))
+  for (const t of types) CATEGORY_OF[t] = cat;
+
+const NO_TYPE_FILL = '#d8dbe0';   // index, README, log, howto, TODO
+const fillOf = n => TYPE_FILL[n.meta.type] || NO_TYPE_FILL;
+
+// A ring is drawn only when status says something worth seeing. `active` and
+// `stable` are the resting state, so they get the default hairline.
+const STATUS_RING = {
+  'draft':                 {c:'#eab308', dash:'3 2'},
+  'superseded':            {c:'#6b7280', dash:'3 2'},
+  'deprecated':            {c:'#6b7280', dash:'3 2'},
+  'Not Ready':             {c:'#9ca3af', dash:'3 2'},
+  // The task lifecycle's own `Superseded`, distinct from a document's
+  // lowercase `superseded`. Missing here, a superseded ticket drew no ring at
+  // all and read as an ordinary node.
+  'Superseded':            {c:'#6b7280', dash:'3 2'},
+  'Ready for Development': {c:'#2563eb'},
+  'In Progress':           {c:'#f59e0b'},
+  'Testing':               {c:'#7c3aed'},
+  'Complete':              {c:'#10b981'},
+  'Delivered':             {c:'#047857'},
+};
+const ringOf = n => STATUS_RING[n.meta.status] || null;
+// "Ready for Development" has spaces, which the filter splits on. Normalising
+// both sides to a hyphenated slug lets @ready-for-development work, while
+// plain @ready still substring-matches.
+const norm = v => String(v || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+// Kept for the panel's status chip, which wants one colour for the status.
+const colorOf = n => (ringOf(n) || {c:'#94a3b8'}).c;
+// Label by the frontmatter title, which is what a person reading the graph is
+// looking for. Titles run long, so they are truncated on a word boundary where
+// one is near the limit; the full title and path are in the hover tooltip and
+// the panel. Files with no title (index, README, log) keep the filename, with
+// their folder prefixed so a dozen of them stay distinct.
+const LABEL_MAX = 34;
+const fileLabel = n => {
+  const parts = n.path.split('/');
+  const f = parts.pop().replace(/\.md$/, '');
+  return /^(index|README|TODO|log|howto)$/i.test(f) && parts.length ? `${parts.pop()}/${f}` : f;
+};
+const titleOf = n => {
+  // The id goes in front. A node seen in the graph could not be quoted in a
+  // commit message or a journal without opening it first, which is a
+  // retrieval cost on the one view that shows you everything at once.
+  const id = (n.meta && n.meta.id || '').trim();
+  const t = (n.meta && n.meta.title || '').trim();
+  const body = t || fileLabel(n);
+  const room = id ? LABEL_MAX - id.length - 1 : LABEL_MAX;
+  let short = body;
+  if (body.length > room) {
+    const cut = body.slice(0, room);
+    const sp = cut.lastIndexOf(' ');
+    short = (sp > room - 12 ? cut.slice(0, sp) : cut.trimEnd()) + '…';
+  }
+  return id ? `${id} ${short}` : short;
+};
+const byPath = new Map(DATA.nodes.map(n => [n.path, n]));
+document.getElementById('meta').textContent = `${DATA.nodes.length} files  ${DATA.links.length} links  ${DATA.generated.replace('T',' ').slice(0,16)}Z`;
+// Declared here, not beside the panel code: the legend escapes labels at
+// module level, so a const declared later is still in its dead zone.
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const legend = document.getElementById('legend');
+// Keyboard accelerators. Each legend entry claims the first letter of its own
+// name that nothing else has taken, so the key is always visible in the word
+// itself — [D]ecision, g[L]ossary, Read[Y] for Development. Entries that run
+// out of free letters fall back to a digit. Keys are unique across both rows,
+// because one keystroke has to be unambiguous.
+const ACCEL = new Map();
+// Keyboard accelerators. Every entry wants a letter from its own name so the
+// key is visible in the word — [D]ecision, g[L]ossary, De[P]recated — and no
+// two entries may share one, since a keystroke has to be unambiguous.
+//
+// Claiming greedily in order runs out: by the time it reaches "deprecated"
+// every one of d,e,p,r,c,a,t is spoken for, and three entries fall back to
+// digits. This is a bipartite matching problem, so solve it as one — Kuhn's
+// augmenting path lets a later entry displace an earlier one onto a different
+// letter of its own name. Only entries with no possible letter take a digit.
+function assignAccels(labels, weight){
+  const cand = labels.map(l =>
+    [...new Set(l.toLowerCase().split('').filter(c => c >= 'a' && c <= 'z'))]);
+  // Kuhn's augmenting path. Candidates stay in word order so a first letter is
+  // tried before a later one.
+  const run = order => {
+    const owner = new Map();
+    const augment = (u, seen) => {
+      for (const c of cand[u]) {
+        if (seen.has(c)) continue;
+        seen.add(c);
+        if (!owner.has(c) || augment(owner.get(c), seen)) { owner.set(c, u); return true; }
+      }
+      return false;
+    };
+    order.forEach(u => augment(u, new Set()));
+    const keys = new Array(labels.length).fill(null);
+    owner.forEach((u, c) => { keys[u] = c; });
+    // Cardinality first, then naturalness: the total distance of each key from
+    // the start of its own word, weighted. [D]ecision beats d[E]cision, and a
+    // weight lets the primary channel win a contested letter — decision labels
+    // 14 nodes and deprecated labels none, so decision should get D.
+    let size = 0, cost = 0;
+    keys.forEach((k, i) => {
+      if (!k) { cost += 50; return; }
+      size++; cost += weight[i] * labels[i].toLowerCase().indexOf(k);
+    });
+    return { keys, size, cost };
+  };
+  // Which entry claims first decides who gets their first letter, so try a
+  // spread of orders and keep the best. Seeded, so the keymap is stable.
+  const idx = labels.map((_, i) => i);
+  const byTightness = idx.slice().sort((a, b) => cand[a].length - cand[b].length || a - b);
+  let best = null, seed = 7;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const orders = [idx, byTightness, idx.slice().reverse()];
+  for (let t = 0; t < 200; t++) {
+    const o = idx.slice();
+    for (let i = o.length - 1; i > 0; i--) { const j = (rnd() * (i + 1)) | 0; [o[i], o[j]] = [o[j], o[i]]; }
+    orders.push(o);
+  }
+  for (const o of orders) {
+    const r = run(o);
+    if (!best || r.size > best.size || (r.size === best.size && r.cost < best.cost)) best = r;
+  }
+  const keys = best.keys;
+  let d = 1;
+  for (let i = 0; i < keys.length; i++) if (!keys[i] && d <= 9) keys[i] = String(d++);
+  return keys;
+}
+function accelHtml(label, key){
+  if (!key) return esc(label);
+  const i = label.toLowerCase().indexOf(key);
+  if (i < 0) return `<b class="key">[${esc(key)}]</b> ${esc(label)}`;   // digit fallback
+  return esc(label.slice(0, i))
+       + `<b class="key">[${esc(label[i].toUpperCase())}]</b>`
+       + esc(label.slice(i + 1));
+}
+function legendGroup(label, items, keys){
+  const g = document.createElement('div');
+  g.className = 'legend-group';
+  g.innerHTML = `<b>${label}</b>` + items.map(([l, swatch, q], i) => {
+    // A category heading carries its own markup and its own filter; it is not
+    // a swatch and must not be escaped as one.
+    if (!q && l.startsWith('<b')) return l;
+    const key = keys[i];
+    if (key) ACCEL.set(key, q);
+    return `<span data-filter="${q}" title="Filter by ${q}${key ? ` — key ${key}` : ''}">${swatch}${accelHtml(l, key)}</span>`;
+  }).join('');
+  legend.appendChild(g);
+}
+
+const swatchFor = t =>
+  `<i style="background:${t === '(untyped)' ? NO_TYPE_FILL : TYPE_FILL[t]}"></i>`;
+const TYPE_ITEMS = Object.keys(TYPE_FILL).concat(['(untyped)']).map(t =>
+  [t, swatchFor(t), t === '(untyped)' ? '@untyped' : '@' + norm(t)]);
+const STATUS_ITEMS = Object.keys(STATUS_RING).concat(['active']).map(k => {
+  const r = STATUS_RING[k];
+  const style = r ? `border-color:${r.c};${r.dash ? 'border-style:dashed;' : ''}` : 'border-color:var(--line)';
+  return [k, `<i class="ring" style="${style}"></i>`, '@' + norm(k)];
+});
+// Matched across both rows at once, not per row.
+const ALL_KEYS = assignAccels(
+  TYPE_ITEMS.concat(STATUS_ITEMS).map(i => i[0]),
+  TYPE_ITEMS.map(() => 3).concat(STATUS_ITEMS.map(() => 1)));
+// Grouped under the four category names rather than listed alphabetically,
+// so the legend teaches the model the way docs/lineage.svg does. The category
+// name is itself a filter: `@intent` selects everything in that column.
+const typeKeys = ALL_KEYS.slice(0, TYPE_ITEMS.length);
+const keyOfType = new Map(TYPE_ITEMS.map((it, i) => [it[0], typeKeys[i]]));
+const grouped = [];
+for (const [cat, types] of Object.entries(CATEGORY)) {
+  grouped.push([`<b class="cat" data-filter="@${cat}" title="Filter by @${cat}">${cat}</b>`, '', '']);
+  for (const t of types)
+    if (TYPE_FILL[t]) grouped.push([t, swatchFor(t), '@' + norm(t)]);
+}
+for (const t of ['glossary', '(untyped)'])
+  grouped.push([t, swatchFor(t), t === '(untyped)' ? '@untyped' : '@' + norm(t)]);
+legendGroup('type', grouped, grouped.map(it => keyOfType.get(it[0]) || ''));
+legendGroup('status', STATUS_ITEMS, ALL_KEYS.slice(TYPE_ITEMS.length));
+
+const svg = d3.select('svg'), view = d3.select('#view');
+const stage = document.getElementById('stage');
+const W = () => stage.clientWidth, H = () => stage.clientHeight;
+const nodes = DATA.nodes.map(n => ({...n, id:n.path, degree:0}));
+const links = DATA.links.filter(l => byPath.has(l.source) && byPath.has(l.target)).map(l => ({...l}));
+links.forEach(l => { const s=nodes.find(n=>n.id===l.source), t=nodes.find(n=>n.id===l.target); if(s) s.degree++; if(t) t.degree++; });
+const radius = n => 6 + Math.min(10, n.degree * 1.4);
+
+const sim = d3.forceSimulation(nodes)
+  .force('link', d3.forceLink(links).id(d=>d.id).distance(90).strength(.6))
+  .force('charge', d3.forceManyBody().strength(-260))
+  .force('collide', d3.forceCollide().radius(n => radius(n) + 26))
+  .force('center', d3.forceCenter(W()/2, H()/2))
+  .force('x', d3.forceX(W()/2).strength(.03)).force('y', d3.forceY(H()/2).strength(.03));
+
+// forceLink rewrites link endpoints from ids to node objects once it runs, so
+// anything reading them has to cope with both.
+const lid = v => (v && typeof v === 'object') ? v.id : v;
+
+const linkG = view.append('g'), nodeG = view.append('g');
+let link = linkG.selectAll('path'), node = nodeG.selectAll('g');
+
+// Nodes and links are joined on every view change rather than once at startup,
+// because focus mode removes nodes from the simulation so the remaining
+// subgraph can lay itself out instead of sitting in the holes the hidden ones
+// left behind.
+function render(visNodes, visLinks){
+  link = linkG.selectAll('path')
+    .data(visLinks, d => lid(d.source) + '>' + lid(d.target))
+    .join('path').attr('class', 'link');
+
+  node = nodeG.selectAll('g')
+    .data(visNodes, d => d.id)
+    .join(enter => {
+      const g = enter.append('g').attr('class', 'node')
+        .call(d3.drag()
+          .on('start', (e,d) => { if(!e.active) sim.alphaTarget(.3).restart(); d.fx=d.x; d.fy=d.y; })
+          .on('drag',  (e,d) => { d.fx=e.x; d.fy=e.y; })
+          .on('end',   (e,d) => { if(!e.active) sim.alphaTarget(0); }))
+        .on('click', (e,d) => { e.stopPropagation(); select(d); });
+      // The status ring must be set with .style(), not .attr(). An SVG stroke
+      // set via .attr() is a presentation attribute, and ANY css rule beats a
+      // presentation attribute — so `.node circle{stroke:var(--bg)}` was
+      // painting every ring the background colour and the rings were
+      // invisible. An inline style outranks the stylesheet; .selected keeps
+      // !important so it still wins.
+      g.append('circle')
+        .attr('r', radius)
+        .attr('fill', fillOf)
+        .style('stroke', n => { const r = ringOf(n); return r ? r.c : null; })
+        .style('stroke-width', n => ringOf(n) ? '2.5px' : null)
+        .style('stroke-dasharray', n => { const r = ringOf(n); return r && r.dash ? r.dash : null; });
+      g.append('title').text(n => {
+        const t = (n.meta && n.meta.title || '').trim();
+        return t ? `${t}\n${n.path}` : n.path;
+      });
+      g.append('text').attr('dy', n => radius(n) + 11).attr('text-anchor','middle').text(titleOf);
+      return g;
+    });
+
+  sim.nodes(visNodes);
+  sim.force('link').links(visLinks);
+  sim.alpha(.6).restart();
+}
+
+// Which nodes the view shows. Without focus that is everything; with focus and
+// an active filter it is the matches, optionally widened by one hop so a
+// filtered set arrives with the documents it cites.
+let focusMode = false, includeLinked = false;
+function applyView(){
+  let visNodes = nodes, visLinks = links;
+  if (focusMode && matchSet && matchSet.size) {
+    const keep = new Set(matchSet);
+    if (includeLinked) links.forEach(l => {
+      const a = lid(l.source), b = lid(l.target);
+      if (matchSet.has(a)) keep.add(b);
+      if (matchSet.has(b)) keep.add(a);
+    });
+    visNodes = nodes.filter(n => keep.has(n.id));
+    visLinks = links.filter(l => keep.has(lid(l.source)) && keep.has(lid(l.target)));
+  }
+  render(visNodes, visLinks);
+  applyDim();
+}
+
+sim.on('tick', () => {
+  link.attr('d', d => `M${d.source.x},${d.source.y}L${d.target.x},${d.target.y}`);
+  node.attr('transform', d => `translate(${d.x},${d.y})`);
+});
+const zoom = d3.zoom().scaleExtent([.15, 6]).on('zoom', e => view.attr('transform', e.transform));
+svg.call(zoom).on('dblclick.zoom', null).on('dblclick', () => svg.transition().duration(350).call(zoom.transform, d3.zoomIdentity));
+svg.on('click', () => { clearSelection(); });
+
+let selected = null;
+// The active filter's matching node ids, or null when no filter is set. Dim
+// state is a function of BOTH this and the selection, so neither clobbers the
+// other — clicking a node used to overwrite .dim and wipe out the filter.
+let matchSet = null;
+function neighbours(d){ const s=new Set([d.id]); links.forEach(l=>{ if(lid(l.source)===d.id) s.add(lid(l.target)); if(lid(l.target)===d.id) s.add(lid(l.source)); }); return s; }
+// Single source of truth for dimming. A filter, once set, owns which nodes are
+// dim; a selection then only adds the ring and narrows the links. With no
+// filter, selection dims to the neighbourhood as before.
+function applyDim(){
+  const nb = selected ? neighbours(selected) : null;
+  node.classed('selected', n => selected ? n.id === selected.id : false);
+  node.classed('dim', n => {
+    // In focus mode non-matching nodes are gone, so dim reverts to showing the
+    // selection's neighbourhood within whatever is on screen.
+    if (matchSet && !focusMode) return !matchSet.has(n.id);
+    return nb ? !nb.has(n.id) : false;
+  });
+  link.classed('dim', l => {
+    if (selected) return lid(l.source) !== selected.id && lid(l.target) !== selected.id;
+    if (matchSet && !focusMode) return !(matchSet.has(lid(l.source)) && matchSet.has(lid(l.target)));
+    return false;
+  });
+}
+function select(d){ selected = d; applyDim(); openPanel(d); }
+function clearSelection(){ selected = null; closePanel(); applyDim(); }
+
+const panel = document.getElementById('panel'), panelTop = panel.querySelector('.top'), body = panel.querySelector('.body');
+panel.querySelector('.close').onclick = clearSelection;
+const linkify = v => /^https?:\/\//.test(v) ? `<a href="${esc(v)}" target="_blank" rel="noopener">${esc(v.replace(/^https?:\/\/github\.com\//,''))}</a>` : esc(v);
+// Resolve a relative markdown href against a node's own directory.
+function resolve(fromPath, href){
+  if (!href || /^https?:/.test(href) || href.startsWith('#')) return null;
+  const base = fromPath.split('/').slice(0,-1).join('/');
+  const stack = [];
+  ((base ? base + '/' : '') + href.split('#')[0]).split('/').forEach(p => {
+    if (p === '..') stack.pop(); else if (p && p !== '.') stack.push(p);
+  });
+  const t = stack.join('/');
+  return byPath.get(t) || byPath.get(t + '.md') || null;
+}
+function goTo(path){
+  const n = nodes.find(x => x.id === path);
+  if (!n) return;
+  select(n);
+  svg.transition().duration(400).call(zoom.transform, d3.zoomIdentity.translate(W()/2 - n.x, H()/2 - n.y));
+}
+// A frontmatter value that names a file in the graph becomes a link into it,
+// labelled by the target's title rather than its path.
+function metaLink(fromPath, v){
+  const hit = resolve(fromPath, String(v));
+  if (hit) {
+    const label = (hit.meta && hit.meta.title) || hit.path.split('/').pop();
+    return `<a href="#" class="internal" data-goto="${esc(hit.path)}" title="${esc(hit.path)}">${esc(label)}</a>`;
+  }
+  return linkify(String(v));
+}
+function openPanel(d){
+  const m = d.meta || {};
+  const chips = [];
+  if (m.status) chips.push(`<span class="chip status chip--filter" data-filter="@${esc(norm(m.status))}" title="Filter by @${esc(norm(m.status))}" style="background:${colorOf(d)}"><b>${esc(m.status)}</b></span>`);
+  if (m.type) chips.push(`<span class="chip chip--filter" data-filter="@${esc(norm(m.type))}" title="Filter by @${esc(norm(m.type))}">type <b>${esc(m.type)}</b></span>`);
+  if (m.initiative) chips.push(`<span class="chip">initiative <b>${esc(m.initiative)}</b></span>`);
+  if (m.claimed_by) chips.push(`<span class="chip">claimed by <b>${esc(m.claimed_by)}</b></span>`);
+  (Array.isArray(m.tags)?m.tags:[]).forEach(t => chips.push(`<span class="chip chip--tag" data-tag="${esc(t)}" title="Filter by #${esc(t)}">#${esc(t)}</span>`));
+  const rows = [];
+  const show = (k,v) => rows.push(`<dt>${esc(k)}</dt><dd>${v}</dd>`);
+  if (m.description) show('description', esc(m.description));
+  if (m.timestamp) show('timestamp', esc(m.timestamp));
+  if (m.claimed_at) show('claimed at', esc(m.claimed_at));
+  if (m.repos) show('repos', esc(Array.isArray(m.repos)?m.repos.join(', '):m.repos));
+  if (m.blocked_by && m.blocked_by.length) show('blocked by', (Array.isArray(m.blocked_by)?m.blocked_by:[m.blocked_by]).map(v=>metaLink(d.path,v)).join('<br>'));
+  if (m.spec) show('spec', (Array.isArray(m.spec)?m.spec:[m.spec]).map(v=>metaLink(d.path,v)).join('<br>'));
+  if (m.resource) show('resource', metaLink(d.path, m.resource));
+  if (m.superseded_by) show('superseded by', metaLink(d.path, m.superseded_by));
+  if (m.pr) show('pr', (Array.isArray(m.pr)?m.pr:[m.pr]).map(linkify).join('<br>'));
+  if (m.wontfix) show('wontfix', 'yes');
+  show('modified', esc(d.mtime.replace('T',' ').slice(0,16)+' UTC'));
+  const outs = links.filter(l=>l.source.id===d.id).map(l=>l.target.id).sort();
+  const inns = links.filter(l=>l.target.id===d.id).map(l=>l.source.id).sort();
+  // Each link carries the same two channels the nodes do: a dot filled by
+  // **type** and, for a task, a chip coloured by **status**. Reusing `fillOf`
+  // and `STATUS_RING` rather than picking fresh colours is the whole point —
+  // a second palette meaning the same things is how a legend stops being true.
+  //
+  // The status chip is on tasks only. Everything else is `active` or has no
+  // status at all, and a row of chips all saying the same word is noise that
+  // makes the one that differs harder to see.
+  const linkList = paths => paths.map(pth => {
+    const n = byPath.get(pth);
+    const meta = (n && n.meta) || {};
+    const label = meta.title || pth.split('/').pop();
+    const type = meta.type || 'untyped';
+    const dot = `<i class="ldot" style="background:${n ? fillOf(n) : NO_TYPE_FILL}" title="${esc(type)}"></i>`;
+    const ring = n ? ringOf(n) : null;
+    const chip = (type === 'task' && meta.status)
+      ? ` <em class="lstatus" style="color:${ring ? ring.c : '#94a3b8'};border-color:${ring ? ring.c : '#94a3b8'}">${esc(meta.status)}</em>`
+      : '';
+    return `<li>${dot}<a href="#" class="internal" data-goto="${esc(pth)}" title="${esc(pth)}">${esc(label)}</a>${chip}</li>`;
+  }).join('');
+  // Counts alone can be read but not followed, so each is a disclosure that
+  // lists the files. <details> keeps the open/closed state without any JS.
+  const grp = (word, paths) => paths.length
+    ? `<details class="linkgrp"><summary>${paths.length} ${word}</summary><ul>${linkList(paths)}</ul></details>`
+    : `<span class="muted">0 ${word}</span>`;
+  show('links', grp('out', outs) + grp('in', inns));
+  panelTop.innerHTML = `<div class="path">${esc(d.path)}</div><h2>${esc(m.title || d.path.split('/').pop())}</h2><div class="chips">${chips.join('')}</div><dl class="kv">${rows.join('')}</dl>`;
+  panelTop.querySelectorAll('a[data-goto]').forEach(a => {
+    a.onclick = ev => { ev.preventDefault(); goTo(a.getAttribute('data-goto')); };
+  });
+  panelTop.querySelectorAll('[data-tag]').forEach(el => {
+    el.onclick = () => { searchEl.value = '#' + el.getAttribute('data-tag'); applyFilter(); };
+  });
+  wireFilterables(panelTop);
+  marked.setOptions({gfm:true, breaks:false});
+  body.innerHTML = marked.parse(d.body || '');
+  body.querySelectorAll('a[href]').forEach(a => {
+    const href = a.getAttribute('href');
+    if (/^https?:/.test(href)) { a.target='_blank'; a.rel='noopener'; return; }
+    const hit = resolve(d.path, href);
+    if (hit) { a.classList.add('internal'); a.href = '#'; a.onclick = ev => { ev.preventDefault(); goTo(hit.path); }; }
+  });
+  body.scrollTop = 0; panel.classList.add('open');
+}
+function closePanel(){ panel.classList.remove('open'); }
+
+const searchEl = document.getElementById('search'), matchEl = document.getElementById('matches');
+// A term beginning with "#" filters on frontmatter tags; a bare term matches
+// path or title. Terms are ANDed, so "#ci #security" narrows rather than widens
+// and "#ci polling" mixes the two.
+function applyFilter(){
+  const raw = searchEl.value.trim().toLowerCase();
+  clearEl.hidden = !searchEl.value;
+  if (!raw) {
+    matchSet = null;
+    matchEl.textContent = '';
+    applyView();
+    return;
+  }
+  const terms = raw.split(/\s+/);
+  const tagTerms  = terms.filter(t => t.startsWith('#') && t.length > 1).map(t => t.slice(1));
+  const kindTerms = terms.filter(t => t.startsWith('@') && t.length > 1).map(t => norm(t.slice(1)));
+  const textTerms = terms.filter(t => !/^[#@]/.test(t) && t);
+  matchSet = new Set();
+  nodes.forEach(n => {
+    const tags = (Array.isArray(n.meta.tags) ? n.meta.tags : []).map(t => String(t).toLowerCase());
+    const tagsOk = tagTerms.every(q => tags.some(t => t.includes(q)));
+    // @ matches either channel: a type or a status.
+    const kinds = [norm(n.meta.type), norm(n.meta.status)].filter(Boolean);
+    const kindOk = kindTerms.every(q => {
+      if (q === 'untyped') return !n.meta.type;
+      // A category name selects every type in it. Same map the legend groups
+      // by, so the picture and the search cannot drift apart.
+      if (CATEGORY[q]) return CATEGORY[q].includes(norm(n.meta.type));
+      return kinds.some(k => k.includes(q));
+    });
+    const hay = (n.path + ' ' + (n.meta.title || '')).toLowerCase();
+    const textOk = textTerms.every(q => hay.includes(q));
+    if (tagsOk && kindOk && textOk) matchSet.add(n.id);
+  });
+  const hits = matchSet.size;
+  matchEl.textContent = `${hits} hit${hits === 1 ? '' : 's'}`;
+  applyView();
+}
+// Anything carrying data-filter sets the search box and runs the filter:
+// legend entries, and the type/status chips in the panel.
+function wireFilterables(root){
+  root.querySelectorAll('[data-filter]').forEach(el => {
+    el.onclick = () => { searchEl.value = el.getAttribute('data-filter'); applyFilter(); };
+  });
+}
+wireFilterables(legend);
+const focusEl = document.getElementById('focus'), linkedEl = document.getElementById('linked');
+focusEl.onchange = () => { focusMode = focusEl.checked; linkedEl.disabled = !focusMode; applyView(); };
+linkedEl.onchange = () => { includeLinked = linkedEl.checked; applyView(); };
+const clearEl = document.getElementById('clear');
+function clearSearch(){ searchEl.value = ''; applyFilter(); searchEl.focus(); }
+clearEl.onclick = clearSearch;
+searchEl.addEventListener('keydown', e => { if (e.key === 'Escape') clearSearch(); });
+// A bracketed key applies that legend entry's filter; pressing it again clears
+// it. Ignored while typing in a field, and never steals a browser shortcut.
+document.addEventListener('keydown', e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  if (e.key === 'Escape') { clearSearch(); return; }
+  const q = ACCEL.get(e.key.toLowerCase());
+  if (!q) return;
+  e.preventDefault();
+  searchEl.value = (searchEl.value.trim() === q) ? '' : q;
+  applyFilter();
+});
+searchEl.addEventListener('input', applyFilter);
+applyView();   // first paint
+window.addEventListener('resize', () => { sim.force('center', d3.forceCenter(W()/2, H()/2)).alpha(.2).restart(); });
+</script></body></html>'''
+
+if __name__ == '__main__':
+    sys.exit(main() or 0)

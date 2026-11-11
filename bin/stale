@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Find countable claims that have quietly gone false.
+
+Usage: brain/bin/stale [--quiet]
+Exit 1 if any claim contradicts the repository. Exit 0 if none do.
+
+## Why this exists
+
+Three times in two days this project shipped a false statement with a green
+test suite:
+
+  * `brain/knowledge-catalog/decisions/0003` described a webhook and the Check
+    Runs API. Neither was ever built; 017 built dispatch-and-polling and a
+    commit status.
+  * A comment in `changes/show.tsx` said the adversarial probes were "wired and
+    have never run". Four of them ship and review 11 ran all four.
+  * `bootstrap.sh` says 26 tests. `submission.md` says 450. There are 628.
+
+None of those broke anything. All three were visible to a reader, and two were
+in the documents written specifically for an audience. A test suite checks that
+the code does what the code says; nothing was checking that the prose does.
+
+## What it can and cannot catch
+
+It catches **countable claims**: a number, in digits or words, next to a noun
+this script knows how to count. That is a narrow class and deliberately so — a
+check that tried to verify prose generally would be a check nobody believed.
+
+It cannot catch a claim about *mechanism*, which is what 0003's drift was. For
+that there is no substitute for reading, and the right prompt to read is a
+change that touches the thing described. `/grill-change` asks for exactly that.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+BRAIN = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+
+def _repo_root():
+    """Where the host repository starts, read from `config.md` rather than guessed.
+
+    This used to be `../..` with every scanned path hardcoded to begin
+    `brain/`, which is correct only when the brain is exactly one level down
+    *and* its directory happens to be called `brain`. The template passed its
+    own checks by coincidence of its folder name — the kind of thing D0001
+    exists to stop, applied here to the tooling itself.
+    """
+    mode = 'template'
+    cfg = os.path.join(BRAIN, 'config.md')
+    if os.path.isfile(cfg):
+        m = re.search(r'^mode:\s*(\S+)', open(cfg, encoding='utf-8').read(), re.M)
+        if m:
+            mode = m.group(1).strip('"\'')
+    return os.path.dirname(BRAIN) if mode == 'embedded' else BRAIN
+
+
+ROOT = _repo_root()
+
+# Numbers get written out in prose, and the two stalest claims found so far
+# were both words: "fifteen numbered decisions", "twenty tickets".
+WORDS = {
+    'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6,
+    'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10, 'eleven': 11, 'twelve': 12,
+    'thirteen': 13, 'fourteen': 14, 'fifteen': 15, 'sixteen': 16,
+    'seventeen': 17, 'eighteen': 18, 'nineteen': 19, 'twenty': 20,
+    'twenty-one': 21, 'twenty-two': 22, 'twenty-three': 23, 'twenty-four': 24,
+    'twenty-five': 25, 'twenty-six': 26, 'twenty-seven': 27,
+    'twenty-eight': 28, 'twenty-nine': 29, 'thirty': 30,
+}
+
+# Where a reader looks. Code comments are excluded on purpose: they go stale
+# too, but they are read beside the code that proves them, and scanning them
+# would flood this with matches on test fixtures.
+def _scanned():
+    """Where a reader meets a claim. Paths are resolved against the brain and,
+    when it is embedded, the host repository's own README as well."""
+    out = [os.path.join(BRAIN, p) for p in
+           ('README.md', 'brief', 'knowledge-catalog', 'plans')]
+    if ROOT != BRAIN:
+        out.insert(0, os.path.join(ROOT, 'README.md'))
+    return out
+
+
+SCANNED = _scanned()
+
+# Histories, excluded. `brain-in-practice.md` and `log.md` are append-only
+# accounts of what happened: "Setting AGENT_DRIVER=openai broke
+# seven tests" is a true sentence about a past afternoon, and a check that
+# called it stale would be asking a diary to keep up with the present.
+#
+# This is the line that matters for the whole script. A claim is stale only if
+# it is offered as *currently true*; everything here is offered as a record.
+# The change log's "**Creation** — the build plan and 20 tickets" is a correct
+# statement about the day it was written and carries no past-tense verb for the
+# guard below to catch, which is why the file is named rather than inferred.
+HISTORIES = {'E0001-brain-in-practice.md', 'log.md'}
+
+# The same distinction inside a document that is not itself a history. A past
+# tense next to the number means the sentence is narrating, not asserting.
+NARRATING = re.compile(
+    r'\b(broke|broken|changed|failed|fixed|was|were|had|used to|caught|'
+    r'asserted|added|removed|went|found|left|shipped|took|handed|'
+    r'returned|raised|closed|opened|agreed)\b', re.I,
+)
+
+
+def run(cmd, cwd=None):
+    try:
+        out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=180)
+        return out.stdout
+    except (OSError, subprocess.SubprocessError):
+        return ''
+
+
+def count_files(folder, skip=()):
+    path = os.path.join(BRAIN, folder)
+
+    if not os.path.isdir(path):
+        return None
+
+    return len([
+        f for f in os.listdir(path)
+        if f.endswith('.md') and f not in skip and not f.startswith('.')
+    ])
+
+
+def count_tickets():
+    """Every numbered task file across every initiative folder."""
+    base = os.path.join(BRAIN, 'tasks')
+
+    if not os.path.isdir(base):
+        return None
+
+    n = 0
+    for init in os.listdir(base):
+        folder = os.path.join(base, init)
+        if os.path.isdir(folder):
+            n += len([f for f in os.listdir(folder) if re.match(r'^T\d{4}-.*\.md$', f)])
+    return n
+
+
+FACTS_FILE = 'facts.md'
+
+
+def declared_facts():
+    """Counts a host project declares for itself, from `brain/facts.md`.
+
+    `facts()` below is the right design and the wrong place: adding a count
+    meant editing this script, so a project wanting "tests" or "migrations"
+    checked either patched the tool or went without (T0004, gap 2 of E0002).
+
+    The cost became concrete when an adopter wrote an invariant claiming every
+    resume PDF is at most two pages. One was three. `bin/lint` passed and this
+    tool reported "Nothing contradicts the repository", because `pages` was not
+    a noun it knew and nothing could teach it one. D0005 was corrected to say
+    an `invariant:` is *surfaceable, not checkable*; this is the narrow case
+    that can be made checkable, and only this one — a countable claim measured
+    against a number the project can produce on demand.
+
+    The format is a markdown table, because a person has to be able to read
+    what their gate is about to run:
+
+        | noun | command |
+        |---|---|
+        | tests | pytest --collect-only -q --no-header | tail -1 |
+        | pages | scripts/count-pdf-pages.sh docs/resume.pdf |
+
+    A command containing a pipe works, because only the first two cells are
+    read and everything after the second `|` is part of the command.
+
+    **These commands execute when `bin/stale` runs.** That is the same trust
+    model as a Makefile or an npm script in a checked-out repository, and it is
+    stated here because it changes this tool's risk profile: `bin/stale` could
+    previously only read. A file nobody wrote runs nothing.
+    """
+    path = os.path.join(BRAIN, FACTS_FILE)
+    if not os.path.isfile(path):
+        return [], []
+
+    out, problems = [], []
+    for line in open(path, encoding='utf-8'):
+        line = line.strip()
+        if not line.startswith('|') or line.startswith('|-'):
+            continue
+        # Split once. Splitting on every `|` truncated any command containing
+        # a pipe, which is most useful ones — and the docstring above promised
+        # the opposite, so the claim was about to be false in the tool that
+        # exists to catch false claims.
+        cells = [c.strip() for c in line.strip('|').split('|', 1)]
+        if len(cells) < 2 or cells[0].lower() in ('noun', ''):
+            continue
+        noun, command = cells[0], cells[1].rstrip('|').strip()
+        if not re.match(r'^[a-z][a-z0-9 _-]*$', noun, re.I):
+            problems.append(f'`{noun}` is not a noun this can match on')
+            continue
+        try:
+            p = subprocess.run(command, cwd=ROOT, shell=True, timeout=60,
+                               capture_output=True, text=True)
+        except (OSError, subprocess.SubprocessError) as e:
+            problems.append(f'`{noun}`: command did not run ({e})')
+            continue
+        value = (p.stdout or '').strip().split('\n')[-1].strip()
+        if p.returncode != 0 or not re.fullmatch(r'\d{1,9}', value):
+            # Reported, never guessed at. A fact that cannot be produced is
+            # not a fact of zero.
+            problems.append(
+                f'`{noun}`: expected a number, got '
+                + (repr(value[:40]) if value else f'exit {p.returncode}'))
+            continue
+        out.append({'name': noun, 'actual': int(value), 'nouns': [noun]})
+    return out, problems
+
+
+def facts():
+    """What is true right now, with the words a document would use to claim it.
+
+    `patterns` are matched against the text *around* a number. Keep them
+    specific: `tests` alone would match "the tests in this directory".
+    """
+    return [
+        {
+            'name': 'decisions',
+            'actual': count_files('knowledge-catalog/decisions', skip=('index.md',)),
+            'nouns': ['decisions'],
+        },
+        {
+            'name': 'tickets',
+            'actual': count_tickets(),
+            'nouns': ['tickets', 'tasks'],
+        },
+    ]
+
+
+# Words allowed to sit between a number and the noun it counts. A count reads
+# as "628 tests" or "fifteen numbered decisions"; anything else between the two
+# means the number is counting something else.
+#
+# This replaced a proximity window, which produced three false positives for
+# every real one: a decision *reference* (`decisions/0013-…`) read as a count
+# of decisions, and "2 min 20 is test runs" read as a count of tests. Both were
+# numbers that merely sat near the noun.
+QUALIFIERS = r'(?:numbered|passing|green|total|distinct|open|active|separate|new|more|further)'
+
+# A limiting word *before* the number makes it a subset rather than a total.
+# "the first fifteen decisions sequenced into eight stages" is exactly right
+# about a plan written when there were fifteen, and is not a claim that
+# fifteen is all there are.
+LIMITED = re.compile(r'\b(first|last|original|initial|earlier|next|another|only|some|or)\s+$', re.I)
+
+# A limiting word *after* the noun scopes the count to something other than
+# the whole corpus. All four of these are real sentences from a real catalog,
+# and all four were reported as stale:
+#
+#   "the reason for two decisions below"      — the two discussed here
+#   "One or two decisions per email, maximum" — a rate, not a total
+#   "750 tasks/mo suffices"                   — a Zapier plan tier
+#
+# `LIMITED` only ever looked backwards, which catches "the first fifteen
+# decisions" and misses every one of these.
+TRAILING_LIMIT = re.compile(
+    r'^\s*(below|above|here|per\b|/mo\b|/month\b|each\b|a day\b|a week\b|'
+    r'a month\b|in this\b|of (?:this|that|its|their|the \w+)\b|listed|shown|described|'
+    r'that\b|which\b)', re.I)
+
+
+def claims(line, value, literal, nouns):
+    """Does this line actually claim `value` of one of `nouns`?"""
+    for noun in nouns:
+        pattern = rf'\b{re.escape(literal)}\b(?:\s+{QUALIFIERS})*\s+{noun}\b'
+
+        for m in re.finditer(pattern, line, re.I):
+            # A number inside a path or an identifier is a reference, not a
+            # count: `decisions/0013-ask-the-venue` is not thirteen decisions.
+            before = line[max(0, m.start() - 1):m.start()]
+            after = line[m.start() + len(literal):m.start() + len(literal) + 1]
+
+            if before in '/-_.' or after in '/-_':
+                continue
+
+            if LIMITED.search(line[:m.start()]):
+                continue
+
+            if TRAILING_LIMIT.match(line[m.end():]):
+                continue
+
+            return True
+
+    return False
+
+
+def targets():
+    for path in SCANNED:
+        if os.path.isfile(path):
+            yield path
+        elif os.path.isdir(path):
+            for base, dirs, files in os.walk(path):
+                dirs[:] = [d for d in dirs if d not in {'.git', 'node_modules'}]
+                for name in sorted(files):
+                    if name in HISTORIES:
+                        continue
+                    if name.endswith(('.md', '.sh')):
+                        yield os.path.join(base, name)
+
+
+def numbers_in(text):
+    """Every number in a line, digits or words, with where it sits."""
+    found = []
+
+    for m in re.finditer(r'\b(\d{1,4})\b', text):
+        found.append((int(m.group(1)), m.start(), m.end(), m.group(1)))
+
+    for word, value in WORDS.items():
+        for m in re.finditer(rf'\b{re.escape(word)}\b', text, re.I):
+            found.append((value, m.start(), m.end(), m.group(0)))
+
+    return found
+
+
+def check(quiet=False):
+    extra, problems = declared_facts()
+    known = [f for f in facts() if f['actual'] is not None] + extra
+
+    if not known:
+        print('Could not establish any project facts to check against.', file=sys.stderr)
+        return 1
+
+    findings = []
+
+    for path in targets():
+        rel = os.path.relpath(path, BRAIN)
+
+        try:
+            lines = open(path, encoding='utf-8').read().split('\n')
+        except OSError:
+            continue
+
+        for lineno, line in enumerate(lines, 1):
+            for value, start, end, literal in numbers_in(line):
+                for fact in known:
+                    if value == fact['actual']:
+                        continue
+
+                    if NARRATING.search(line):
+                        continue
+
+                    if claims(line, value, literal, fact['nouns']):
+                        findings.append({
+                            'path': rel,
+                            'line': lineno,
+                            'claim': literal,
+                            'fact': fact['name'],
+                            'actual': fact['actual'],
+                            'text': re.sub(r'\s+', ' ', line.strip())[:140],
+                        })
+                        break
+
+    if not quiet:
+        print('Countable claims, checked against the repository')
+        print()
+        for fact in known:
+            print(f"  {fact['name']:>22}  {fact['actual']}")
+        print()
+        for p in problems:
+            # A declared fact that could not be produced is reported, never
+            # treated as zero and never silently dropped: the file said this
+            # was checkable and it is not.
+            print(f'  note  facts.md: {p}')
+        if problems:
+            print()
+
+    if not findings:
+        if not quiet:
+            print('  Nothing contradicts the repository.')
+        return 0
+
+    for f in findings:
+        print(f"  STALE  {f['path']}:{f['line']}")
+        print(f"         says {f['claim']} {f['fact']}; there are {f['actual']}")
+        print(f"         “{f['text']}”")
+        print()
+
+    print(f'  {len(findings)} stale claim(s). These are the ones a reader meets.')
+    return 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Find countable claims that have gone false.')
+    ap.add_argument('--quiet', action='store_true')
+    args = ap.parse_args()
+
+    return check(quiet=args.quiet)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

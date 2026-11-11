@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Turn backticked citations of nodes into real links.
+
+Usage:
+    brain/bin/relink --dry-run
+    brain/bin/relink
+    brain/bin/relink knowledge-catalog/decisions   # a subtree only
+
+Exit 0 always.
+
+## Why this exists
+
+A node cited in backticks is a **lost edge**. It does not appear in the graph,
+a reader cannot follow it, and nothing checks it — so it rots in silence the
+first time anything is renamed.
+
+Measured on the first real adoption of this brain: **122** such citations, every
+one genuine — a task naming the decision it carries out, a plan naming the
+runbook it depends on. The catalog had been surveyed before that and reported
+as having *"zero cross-links, a flat pile, not a graph"*, which was the exact
+opposite of the truth. The references were all there; the measurement counted
+only markdown links, and so did every tool.
+
+`bin/lint` reports them. This fixes them, because 122 manual conversions do not
+happen.
+
+## What it will not touch
+
+Only a path carrying an **id** — `D0014-…`, `E0002-…` — is treated as a
+citation. A bare `config.md` or `CONTEXT.md` is a file *name* in prose, and
+linking it would be wrong. That distinction is the whole design: the broader
+rule, "every path reference must be a link", was tried against the same corpus
+and produced roughly three hundred findings of which most were noise.
+
+Also skipped: fenced code, template placeholders (`<slug>`, `*`), and anything
+that does not resolve — a dead citation is a finding for a person, not
+something to rewrite into a dead link.
+"""
+import argparse
+import os
+import re
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+SKIP_DIRS = {'.git', 'bin', 'node_modules', 'example', 'docs', 'hooks'}
+NODE_REF = re.compile(r'(?<!\])`([^`\n]*?(?:^|/)[GDPSTE]\d{4}-[^`\n]*?\.md)`')
+
+
+def label(target):
+    """What the link says. The id alone reads best in prose — `D0014` — and the
+    full slug is noise once the link carries it."""
+    name = os.path.basename(target)
+    m = re.match(r'([GDPSTE]\d{4})-(.+)\.md$', name)
+    return m.group(1) if m else name
+
+
+def convert(path, text, dry):
+    out, fenced, n = [], False, 0
+
+    for line in text.split('\n'):
+        if line.strip().startswith('```'):
+            fenced = not fenced
+            out.append(line)
+            continue
+        if fenced:
+            out.append(line)
+            continue
+
+        def swap(m):
+            nonlocal n
+            target = m.group(1)
+            if '<' in target or '*' in target:
+                return m.group(0)
+            cand = os.path.normpath(os.path.join(os.path.dirname(path), target))
+            if not os.path.isfile(os.path.join(ROOT, cand)):
+                return m.group(0)      # dead: a finding, not a rewrite
+            n += 1
+            return f'[{label(target)}]({target})'
+
+        out.append(NODE_REF.sub(swap, line))
+
+    return '\n'.join(out), n
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Backticked node citations become links.')
+    ap.add_argument('subtree', nargs='?', default='.')
+    ap.add_argument('--dry-run', action='store_true')
+    args = ap.parse_args()
+
+    base = os.path.join(ROOT, args.subtree)
+    total, touched = 0, []
+
+    for here, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for name in sorted(files):
+            if not name.endswith('.md'):
+                continue
+            full = os.path.join(here, name)
+            rel = os.path.relpath(full, ROOT)
+            text = open(full, encoding='utf-8').read()
+            new, n = convert(rel, text, args.dry_run)
+            if n:
+                total += n
+                touched.append((rel, n))
+                if not args.dry_run:
+                    open(full, 'w', encoding='utf-8').write(new)
+
+    if not total:
+        print('No backticked node citations to convert.')
+        return 0
+
+    for rel, n in sorted(touched, key=lambda t: -t[1]):
+        print(f'  {n:>3}  {rel}')
+    verb = 'would convert' if args.dry_run else 'converted'
+    print(f'\n  {verb} {total} citation(s) in {len(touched)} file(s).')
+    if not args.dry_run:
+        print('  Run `bin/graph-build` — these are edges now.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

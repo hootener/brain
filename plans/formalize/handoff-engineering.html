@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ready the brain for other people to adopt</title>
+<style>
+:root{--paper:#FBFBF9;--sheet:#fff;--ink:#1B2431;--soft:#4C5666;--muted:#7A8390;
+--rule:#DDE2E8;--accent:#0E6F6B;--tint:#E8F3F2;--chip:#FFF4DB;--chipink:#8A5A00;
+--serif:"Iowan Old Style",Georgia,serif;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+--mono:ui-monospace,Menlo,monospace}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--paper:#111820;--sheet:#182029;
+--ink:#E8ECF1;--soft:#B8C0CB;--muted:#7F8A97;--rule:#2A3441;--accent:#5BC2BC;--tint:#1C2F2E;
+--chip:#3A2E12;--chipink:#F2C25B}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.65 var(--sans);
+-webkit-font-smoothing:antialiased}
+.wrap{max-width:46rem;margin:0 auto;padding:4rem 1.5rem 6rem}
+header{border-bottom:2px solid var(--ink);padding-bottom:1.5rem;margin-bottom:2.5rem}
+.eyebrow{font:500 11px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;
+color:var(--accent);margin:0 0 .9rem}
+h1{font:400 2.6rem/1.1 var(--serif);margin:0 0 .6rem;letter-spacing:-.01em}
+.sub{color:var(--muted);font-size:.9rem;margin:0}
+section{margin:0 0 3rem}
+h2{font:400 1.5rem/1.25 var(--serif);margin:0 0 1rem;padding-bottom:.4rem;
+border-bottom:1px solid var(--rule)}
+h3{font:600 .95rem/1.4 var(--sans);margin:1.8rem 0 .5rem}
+p{margin:0 0 1rem;color:var(--soft)}
+strong{color:var(--ink)}
+ul,ol{margin:0 0 1rem;padding-left:1.2rem;color:var(--soft)}
+li{margin:.3rem 0}
+blockquote{margin:1.2rem 0;padding:.8rem 1.1rem;background:var(--tint);
+border-left:3px solid var(--accent);border-radius:0 4px 4px 0}
+blockquote p{margin:0;color:var(--ink)}
+code{font:.85em var(--mono);background:var(--tint);padding:.12em .35em;border-radius:3px}
+pre{background:var(--sheet);border:1px solid var(--rule);border-radius:6px;padding:1rem;
+overflow-x:auto}
+pre code{background:none;padding:0}
+img{max-width:100%;border:1px solid var(--rule);border-radius:6px;display:block;margin:1.2rem 0}
+table{width:100%;border-collapse:collapse;margin:1.2rem 0;font-size:.9rem}
+th,td{text-align:left;padding:.5rem .7rem;border-bottom:1px solid var(--rule)}
+th{font:600 .75rem/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+hr{border:0;border-top:1px solid var(--rule);margin:2rem 0}
+.constraint{display:flex;gap:1rem;padding:.9rem 0;border-bottom:1px solid var(--rule)}
+.constraint:last-child{border-bottom:0}
+.cid{font:600 .78rem/1.6 var(--mono);color:var(--accent);min-width:4.2rem}
+.constraint p{margin:.25rem 0 0;font-size:.92rem}
+.chip{display:inline-block;background:var(--chip);color:var(--chipink);font:600 .62rem/1 var(--mono);
+padding:.22em .45em;border-radius:3px;letter-spacing:.05em;text-transform:uppercase;margin-left:.3rem}
+footer{margin-top:4rem;padding-top:1.2rem;border-top:1px solid var(--rule);
+color:var(--muted);font-size:.8rem}
+@media print{body{background:#fff}.wrap{padding:0;max-width:none}
+section{break-inside:avoid}img{break-inside:avoid}}
+</style></head><body><div class="wrap">
+<header>
+<p class="eyebrow">Handoff &middot; engineering</p>
+<h1>Ready the brain for other people to adopt</h1>
+<p class="sub">Close the gaps the first two real adoptions exposed, so a second operator can install this brain into a project already in flight and trust what it tells them.</p>
+</header>
+<section><h2>In short</h2><p>This repository is a system for keeping the reasoning behind a project — the goals, the decisions, the plans, what was learned afterwards — as plain files that a person, a diff and an agent can all read. It works for the person who built it. This work is about making it work for somebody else.</p>
+<p>Two real projects have now adopted it. Between them they surfaced a dozen defects, none of which the system's own checks could have found, because a system that checks itself passes by construction. What is left is the difference between a tool that works in the hands that made it and one that survives being handed over.</p>
+<p>When this is done, someone who has never seen the repository can fork it, install it into a project they are already halfway through, and have the record stay true as they work — without being taught the system first.</p>
+<p>This serves <strong>A brain someone else can adopt without being told how</strong>.</p></section><section><h2>The first hour</h2><p>Clone it, copy it into a throwaway git repo without its <code>.git</code>, and run <code>bin/adopt</code>. If <code>bin/lint</code> and <code>bin/doctor</code> are not both clean on that fresh install, stop — that is the bug, and it has been the bug twice.</p>
+<p>Then read <code>knowledge-catalog/decisions/</code> in order. <code>D0001</code> is the principle everything else serves; <code>D0002</code> is the taxonomy; <code>D0003</code> is why ids look the way they do. Twenty minutes, and nothing else will make sense without them.</p></section><section><h2>The decisions that bind this</h2><div class="constraint"><div class="cid">D0002</div><div><strong>Every node belongs to one of four categories, and nothing cites a node newer than itself</strong><p>No node may cite a node that is newer than itself.</p></div></div><div class="constraint"><div class="cid">D0005</div><div><strong>Approach nodes name the goal they serve, and decisions carry a machine-readable claim</strong><p>Every Approach node names at least one goal, so every lineage branch terminates in Intent.</p></div></div></section><section><h2>Traps that cost us time</h2><ul><li><strong>The template passes its own linter by construction.</strong> The same hand wrote</li></ul>
+<p>both. Self-testing proves almost nothing here; only content written for some other system finds real defects. Two adoptions found twelve.</p>
+<ul><li><strong><code>sed</code>-style patching of these scripts is treacherous.</strong> Replacing a slice</li></ul>
+<p>between two function definitions silently deleted a third that sat between them, and the failure surfaced two steps later as a <code>NameError</code>. Patch by exact anchored string, then <code>ast.parse</code> before running anything.</p>
+<ul><li>**A markdown paragraph that opens with <code>**bold**</code> will hang a naive</li></ul>
+<p>renderer.** The list-marker break pattern matches the leading <code>*</code>, the inner loop consumes nothing, and the index never advances. Require whitespace after the marker, and keep a guard that always consumes a line.</p>
+<ul><li><strong>A hook invoked through a symlink does not know where it lives.</strong></li></ul>
+<p><code>dirname $0/..</code> resolves to <code>.git</code>. Locate the brain from <code>git rev-parse --show-toplevel</code>, which is what CI does.</p>
+<ul><li>**Rebuilding a generated file and diffing it never works as a staleness</li></ul>
+<p>check** when the generator stamps a timestamp. Compare everything except the stamp; <code>bin/graph-build --check</code> is the pattern.</p></section><section><h2>Verified, and not</h2><p><strong>Verified.</strong> A fresh install is 0 errors and 0 warnings. Both adoptions run clean on <code>lint</code>, <code>doctor</code>, <code>stale</code> and <code>graph-build --check</code>. The direction rule, the id-uniqueness check and the YAML hazard check have each caught a real defect in work written by the person who wrote them.</p>
+<p><strong>Not verified.</strong> No automated test exists for any of it — <code>T0005</code> is exactly that gap. Windows is untested; the symlink needs a privilege there and the copy fallback has never been exercised. No brain has yet been used by two people at once, so every claim about teams is reasoning, not evidence.</p></section><section><h2>Outstanding work</h2><p><strong>Ready for Development</strong></p>
+<ul><li>Teach bin/relevant to defer to bin/constraints once decisions declare what they govern</li><li>Add --owner and --mine to bin/status, and owner inheritance from plan to spec</li><li>Group the graph legend by category and show ids in node labels</li><li>Give bin/stale a per-project facts file so a host project can add a count without editing Python</li><li>Add bin/selftest: adopt into a throwaway host and assert the install is clean</li><li>Model the reason a task is blocked, instead of discarding it on import</li><li>Decide whether an open question is a node type</li></ul></section><section><h2>Running it yourself</h2><p>No dependencies. Every tool is stdlib Python 3 and runs from the brain root:</p>
+<pre><code>bin/lint          the gate
+bin/doctor        is the install sound
+bin/status        what is claimable now
+bin/handoff       this document</code></pre></section><section><h2>Not included</h2><ul><li>A hosted service, a database, or any runtime. The files are the product.</li><li>Deadlines, consent dates, release processes, and anything else that models a</li><li>particular team's way of working rather than the work.</li></ul></section>
+<footer>Generated 2026-11-08 from the project record.
+The parts that come from the record are rewritten on every build; the
+walkthrough and anything written for a reader are not.</footer>
+</div></body></html>

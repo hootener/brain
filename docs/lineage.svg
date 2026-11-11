@@ -1,0 +1,50 @@
+<svg viewBox="0 0 1180 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Four dashed regions left to right: Intent holding a goal and a decision, Approach holding a plan and two specs, Action holding four tasks, and Evidence holding two evidence nodes. Arrows run from intent through approach and action to evidence. Beneath, one arrow labelled IMPLEMENTATION runs left to right, and one labelled REVIEW / AMEND runs right to left, closing the loop from Evidence back to Intent.">
+<defs>
+<marker id="h" viewBox="0 -5 10 10" refX="9" refY="0" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,-4L9,0L0,4" fill="#9a9aa3"/></marker>
+<marker id="r" viewBox="0 -5 10 10" refX="9" refY="0" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,-4L9,0L0,4" fill="#121212"/></marker>
+</defs>
+<rect x="40" y="40" width="200" height="300" fill="none" stroke="#9a9aa3" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="140" y="32" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="11" letter-spacing="1.5" fill="#6b6b73" font-weight="700">INTENT</text>
+<rect x="330" y="40" width="370" height="300" fill="none" stroke="#9a9aa3" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="515" y="32" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="11" letter-spacing="1.5" fill="#6b6b73" font-weight="700">APPROACH</text>
+<rect x="740" y="40" width="160" height="300" fill="none" stroke="#9a9aa3" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="820" y="32" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="11" letter-spacing="1.5" fill="#6b6b73" font-weight="700">ACTION</text>
+<rect x="940" y="40" width="200" height="300" fill="none" stroke="#9a9aa3" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="1040" y="32" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="11" letter-spacing="1.5" fill="#6b6b73" font-weight="700">EVIDENCE</text>
+<line x1="98.7" y1="133.5" x2="381.3" y2="186.5" stroke="#9a9aa3" stroke-width="1.4" marker-end="url(#h)"/>
+<line x1="98.7" y1="246.5" x2="381.3" y2="193.5" stroke="#9a9aa3" stroke-width="1.4" marker-end="url(#h)"/>
+<line x1="418.3" y1="185.0" x2="601.7" y2="135.0" stroke="#9a9aa3" stroke-width="1.4" marker-end="url(#h)"/>
+<line x1="418.3" y1="195.0" x2="601.7" y2="245.0" stroke="#9a9aa3" stroke-width="1.4" marker-end="url(#h)"/>
+<line x1="638.5" y1="125.8" x2="801.5" y2="89.2" stroke="#9a9aa3" stroke-width="1.4" marker-end="url(#h)"/>
+<line x1="638.9" y1="132.4" x2="801.1" y2="152.6" stroke="#9a9aa3" stroke-width="1.4" marker-end="url(#h)"/>
+<line x1="638.9" y1="247.6" x2="801.1" y2="227.4" stroke="#9a9aa3" stroke-width="1.4" marker-end="url(#h)"/>
+<line x1="638.5" y1="254.2" x2="801.5" y2="290.8" stroke="#9a9aa3" stroke-width="1.4" marker-end="url(#h)"/>
+<line x1="838.9" y1="152.9" x2="1021.1" y2="132.1" stroke="#9a9aa3" stroke-width="1.4" marker-end="url(#h)"/>
+<line x1="838.9" y1="227.1" x2="1021.1" y2="247.9" stroke="#9a9aa3" stroke-width="1.4" marker-end="url(#h)"/>
+<circle cx="80" cy="130" r="18" fill="#a5d6a7" stroke="#2a2a2e" stroke-width="1.2"/>
+<text x="80" y="163" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="14" fill="#4a4a52">goal</text>
+<circle cx="80" cy="250" r="18" fill="#b39ddb" stroke="#2a2a2e" stroke-width="1.2"/>
+<text x="80" y="283" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="14" fill="#4a4a52">decision</text>
+<circle cx="400" cy="190" r="18" fill="#f5bd8f" stroke="#2a2a2e" stroke-width="1.2"/>
+<text x="400" y="223" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="14" fill="#4a4a52">plan</text>
+<circle cx="620" cy="130" r="18" fill="#9ecbe8" stroke="#2a2a2e" stroke-width="1.2"/>
+<text x="620" y="163" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="14" fill="#4a4a52">spec</text>
+<circle cx="620" cy="250" r="18" fill="#9ecbe8" stroke="#2a2a2e" stroke-width="1.2"/>
+<text x="620" y="283" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="14" fill="#4a4a52">spec</text>
+<circle cx="820" cy="85" r="18" fill="#aebdd4" stroke="#2a2a2e" stroke-width="1.2"/>
+<text x="820" y="118" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="14" fill="#4a4a52">task</text>
+<circle cx="820" cy="155" r="18" fill="#aebdd4" stroke="#2a2a2e" stroke-width="1.2"/>
+<text x="820" y="188" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="14" fill="#4a4a52">task</text>
+<circle cx="820" cy="225" r="18" fill="#aebdd4" stroke="#2a2a2e" stroke-width="1.2"/>
+<text x="820" y="258" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="14" fill="#4a4a52">task</text>
+<circle cx="820" cy="295" r="18" fill="#aebdd4" stroke="#2a2a2e" stroke-width="1.2"/>
+<text x="820" y="328" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="14" fill="#4a4a52">task</text>
+<circle cx="1040" cy="130" r="18" fill="#9fd8cf" stroke="#2a2a2e" stroke-width="1.2"/>
+<text x="1040" y="163" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="14" fill="#4a4a52">evidence</text>
+<circle cx="1040" cy="250" r="18" fill="#9fd8cf" stroke="#2a2a2e" stroke-width="1.2"/>
+<text x="1040" y="283" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="14" fill="#4a4a52">evidence</text>
+<line x1="40" y1="374" x2="1140" y2="374" stroke="#121212" stroke-width="1.6" marker-end="url(#r)"/>
+<text x="590" y="366" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="13" letter-spacing="1.5" fill="#121212" font-weight="700">IMPLEMENTATION</text>
+<line x1="1140" y1="408" x2="40" y2="408" stroke="#121212" stroke-width="1.6" marker-end="url(#r)"/>
+<text x="590" y="400" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="13" letter-spacing="1.5" fill="#121212" font-weight="700">REVIEW / AMEND</text>
+</svg>

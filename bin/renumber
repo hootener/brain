@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Change a node's id, rewriting the file, its name and every citation of it.
+
+Usage:
+    brain/bin/renumber D0014 D0021
+    brain/bin/renumber D0014 --next      # take the next free id of that type
+    brain/bin/renumber D0014 D0021 --dry-run
+
+Exit 1 if the source is missing or the destination is taken.
+
+## The one sanctioned reason to renumber
+
+Ids are never reused and never reordered (D0003): they are cited from journals,
+`# Log` entries and commit messages, and a renumbering invalidates all of them
+silently. The single exception is a **collision** — two operators adding the
+same id with different slugs, which git merges without a conflict because the
+filenames differ.
+
+Making that one case a command rather than a manual grep is what lets the rule
+be "never renumber" instead of "never renumber, except sometimes, carefully".
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+SKIP = {'.git', 'node_modules', 'docs'}
+ID_RE = re.compile(r'^([GDPSTE])(\d{4})$')
+
+
+def walk():
+    for base, dirs, files in os.walk(ROOT):
+        dirs[:] = [d for d in dirs if d not in SKIP]
+        for name in files:
+            if name.endswith(('.md', '.yml', '.yaml')):
+                yield os.path.join(base, name)
+
+
+def find(ident):
+    for path in walk():
+        if os.path.basename(path).startswith(f'{ident}-'):
+            return path
+    return None
+
+
+def taken(letter):
+    return {int(m.group(1)) for path in walk()
+            for m in [re.match(rf'^{letter}(\d{{4}})-', os.path.basename(path))] if m}
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Renumber a node and every citation.')
+    ap.add_argument('old')
+    ap.add_argument('new', nargs='?')
+    ap.add_argument('--next', action='store_true', help='allocate the next free id')
+    ap.add_argument('--dry-run', action='store_true')
+    args = ap.parse_args()
+
+    if not ID_RE.match(args.old):
+        print(f'`{args.old}` is not an id.', file=sys.stderr)
+        return 1
+
+    letter = args.old[0]
+    new = args.new
+    if args.next or not new:
+        used = taken(letter)
+        new = f'{letter}{(max(used) + 1 if used else 1):04d}'
+    if not ID_RE.match(new) or new[0] != letter:
+        print(f'`{new}` is not a valid {letter} id.', file=sys.stderr)
+        return 1
+
+    src = find(args.old)
+    if not src:
+        print(f'No node with id {args.old}.', file=sys.stderr)
+        return 1
+    if find(new):
+        print(f'{new} is already taken.', file=sys.stderr)
+        return 1
+
+    dst = os.path.join(os.path.dirname(src),
+                       os.path.basename(src).replace(f'{args.old}-', f'{new}-', 1))
+
+    # Every mention: the frontmatter `id:`, link targets carrying the old
+    # filename, and bare references in prose ("see D0014").
+    edits = []
+    for path in walk():
+        text = open(path, encoding='utf-8').read()
+        updated = text.replace(f'{args.old}-', f'{new}-').replace(args.old, new)
+        if updated != text:
+            edits.append((path, updated))
+
+    print(f'{args.old} -> {new}')
+    print(f'  rename {os.path.relpath(src, ROOT)}')
+    print(f'      to {os.path.relpath(dst, ROOT)}')
+    for path, _ in edits:
+        print(f'  edit   {os.path.relpath(path, ROOT)}')
+
+    if args.dry_run:
+        print('\n  --dry-run: nothing written.')
+        return 0
+
+    for path, updated in edits:
+        open(path, 'w', encoding='utf-8').write(updated)
+    if subprocess.run(['git', '-C', ROOT, 'mv', src, dst], capture_output=True).returncode:
+        os.rename(src, dst)
+
+    print(f'\n  Done. Run `bin/lint` and `bin/graph-build`.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

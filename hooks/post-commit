@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Layer 1 of keeping the brain current (D0007): mechanical reconciliation that
+# cannot be forgotten, because nobody has to remember it.
+#
+# Two rules it never breaks:
+#
+#   1. **It never guesses semantics.** Everything ambiguous is left for
+#      /audit. Its entire value is that its output can be trusted without
+#      being re-checked, and one wrong guess ends that.
+#   2. **It never edits and never blocks.** It runs after the commit is
+#      already made, so there is no index to corrupt, and it only ever
+#      prints. A hook that rewrote a status mid-commit would be making a
+#      change nobody asked for at the least convenient moment.
+#
+# Installed by `bin/adopt` into .git/hooks/post-commit. Local to your clone —
+# it is not shared with the team and is removed by deleting that file.
+set -u
+
+# Locate the brain from the repository root, not from this script's own path:
+# git invokes the hook through the symlink in .git/hooks, so `dirname $0/..`
+# resolves to `.git` and the hook exits silently having checked nothing. Found
+# the first time this hook ran — it printed nothing and looked like a clean
+# repository. Same detection the CI workflow uses, so one rule covers both.
+TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+BRAIN=""
+for d in "$TOP" "$TOP/brain"; do
+  [ -x "$d/bin/reconcile" ] && { BRAIN="$d"; break; }
+done
+[ -n "$BRAIN" ] || exit 0
+
+out=$("$BRAIN/bin/reconcile" 2>/dev/null) || exit 0
+
+# Only speak when there is something to say, and only print the sections that
+# actually exist. Anchoring the range on one header printed an empty banner
+# whenever the sole finding was orphan commits — a hook that cries wolf with no
+# wolf attached is one people learn to scroll past.
+# One range, not three. `sed -n '/A/,$p;/B/,$p;/C/,$p'` prints to end-of-file
+# once per matching header, so the last section appeared three times and the
+# middle one twice — visible in this hook's own output on every commit.
+findings=$(printf '%s\n' "$out" \
+  | awk '/Wrong, and the evidence|Cannot tell|name no task/{f=1} f' \
+  | head -20)
+
+if [ -n "$findings" ]; then
+  printf '\n\033[2m── brain ─────────────────────────────────────────────\033[0m\n'
+  printf '%s\n' "$findings"
+  printf '\033[2m   `/audit` resolves these. Nothing has been changed.\033[0m\n\n'
+fi
+
+# The decisions governing what this commit touched. Surfaced, never enforced:
+# whether a decision is contradicted is a person's call (D0005).
+changed=$(git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null)
+if [ -n "$changed" ] && [ -x "$BRAIN/bin/constraints" ]; then
+  governing=$(printf '%s\n' "$changed" | xargs "$BRAIN/bin/constraints" 2>/dev/null \
+              | grep -E '^  [GDPSTE][0-9]{4}' || true)
+  if [ -n "$governing" ]; then
+    printf '\033[2m── decisions governing this commit ───────────────────\033[0m\n'
+    printf '%s\n\n' "$governing"
+  fi
+fi
+
+exit 0
