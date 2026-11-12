@@ -62,6 +62,10 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 GENERIC_DIRS = ['bin', 'skills', 'hooks', 'docs', '.github',
                 'knowledge-catalog/reference/agent-skills/templates']
 GENERIC_FILES = ['INIT.md', 'README.md', 'CLAUDE.md', '.gitignore',
+                 # The licence travels with the code it licenses. An
+                 # adopter who installed before it existed would
+                 # otherwise never receive it from an update.
+                 'LICENSE',
                  # The identity data the citation rewrite needs. Without it an
                  # updated brain was safe only by the absence of the file.
                  '.template-record',

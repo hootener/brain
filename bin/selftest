@@ -687,6 +687,30 @@ def regressions(brain, verbose):
     check('R4 · an update restores every generic file, INIT.md included',
           os.path.isfile(B('INIT.md')), out.strip()[-200:])
 
+    # bin/update's own comment claims selftest "asserts that a fresh install
+    # contains nothing generic this list has missed, so a new top-level file
+    # cannot quietly fall out of the update the way INIT.md did." It did not.
+    # R4 above only proves that deleting INIT.md and updating restores it,
+    # which says nothing about a file nobody listed. Adding LICENSE at the
+    # root left every check green while bin/update would never have delivered
+    # it. Classify every top-level entry, and fail on anything unclaimed.
+    up = open(B('bin', 'update'), encoding='utf-8').read()
+    listed = set(re.findall(r"'([^']+)'", up[up.index('GENERIC_DIRS'):up.index('def fetch')]))
+    claimed, unclaimed = set(), []
+    for name in sorted(os.listdir(ROOT)):
+        # config.md is the one documented exception: bin/update calls it
+        # partly generic and gives it its own line in --list rather than
+        # claiming it is untouched, which would read false to an adopter
+        # who diffed it.
+        if name in ('.git', '.github', 'config.md') or name.startswith('.DS'):
+            continue
+        if name in listed or any(l.split('/')[0] == name for l in listed):
+            claimed.add(name)
+        else:
+            unclaimed.append(name)
+    check('G0001 · every top-level entry is classed generic or yours',
+          not unclaimed, f'unclassified, so never updated: {unclaimed}')
+
     # R3/R4 — a skill body in a user-role envelope published as the operator's.
     _, out = run([B('bin', 'utterances'), '--limit', '200'], brain)
     check('R3 · an injected skill body is not attributed to the operator',
