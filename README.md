@@ -1,4 +1,4 @@
-# brain
+# brain -- better project management for human-agent teams
 
 A codebase records what you built. It does not record why you built it that
 way, and the why is the first thing you lose.
