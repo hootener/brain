@@ -19,13 +19,12 @@ what shipped against what you meant to build. From an interface perspective
 they look a lot like
 [Matt Pocock's agent skills](https://github.com/mattpocock/skills), and several
 share their names outright, `/to-spec`, `/implement`, `/wayfinder` and
-`/code-review` among them. That is intentional. This project supports a very
-similar workflow, with an opinionated graph-based backing store underneath it.
+`/code-review` among them. That is intentional. This project was heavily inspired by agent skills, but wanted to provide a different backing store than GitHub Issues, etc. In fact, if you're using Matt Pocock's agent skills already, you can likely point your agent at this repo and have it modify your existing agent skills to support a brain as a backing store, though I haven't tried this.
 
 ## The four categories
 
-Brain builds a knowledge graph out of typed nodes, and every node sits in
-exactly one of four categories that run left to right.
+Brain builds a directed knowledge graph out of typed nodes, and every node sits in
+exactly one of four categories that run left to right in a directed fashion.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/lineage-dark.svg">
@@ -40,13 +39,13 @@ exactly one of four categories that run left to right.
 - **Evidence** holds `evidence` nodes, which are the observations and what you
   learned from carrying the actions out.
 
-The benefit of this approach is that work runs forward from intent to approach
+The benefit of this approach is that work is directed (in the graph theory sense) from intent to approach
 to action to evidence, and can be measured the whole way. Reviewing your work
 is the same process run backwards, from the evidence and the action back to the
 intent, to make sure that what you did actually met the goal you set out to
 accomplish.
 
-Nodes carry an id: a type letter and four digits, flat and global. `G` goal,
+Nodes carry an id and will be referenced directly by your coding agent. Each is a type letter and four digits, flat and global. `G` goal (e.g., `G0002`),
 `D` decision *and* principle, `P` plan, `S` spec, `T` task, `E` evidence.
 
 ## Installing the brain
@@ -57,27 +56,22 @@ Paste this into the coding agent working on your project:
 
 That is the whole install. The agent asks you where the brain should live,
 fetches the files, runs `bin/adopt`, and then fills the brain with your
-project. It asks about placement rather than guessing, because the answer is
-recorded in `config.md` and moving the files afterwards does not move the
-record of what they are — the next section is what you need to answer it.
+project. 
 
-`bin/adopt` **installs**. It links the skills so Claude Code can see them,
-stamps the dates, records the layout and runs the checks. `INIT.md` **fills**.
-It reads your repository, imports the ADRs and glossary you already have, mines
+`bin/adopt` **installs**. It links the brain's skills so Claude Code can use them, initializes the brain, etc.
+
+`INIT.md` **fills** the brain. It reads your repository, imports the ADRs and glossary you already have, mines
 the Claude transcript history for decisions nobody wrote down, and asks for the
 first goal. They stay separate because one job is mechanical and one needs
-judgment, and because they rerun on different schedules
+judgment, see:
 ([the placement and install decision](knowledge-catalog/decisions/D0004-placement-and-install.md)).
 
-**It works on a project already in flight.** Everything imported from a
-preexisting project is created with `status: draft` and a pointer to where it
-came from, so you can see exactly how much of the record is still
-reconstruction.
+**Fork it first if you mean to keep your own copy.** From time to time, I will update this brain as I think it needs improved. If you want to benefit from those improvements, fork this repo. When installing, point the prompt at your
+fork's raw URL instead of this repo. Later, if you want to update, you can pull upstream changed into your fork, and run `bin/update`.
 
-**Fork it first if you mean to keep your own copy.** Point the prompt at your
-fork's raw URL instead, and `bin/update` will pull later fixes from upstream.
+### Install Methods: Picking embedded or sibling
 
-### Picking embedded or sibling
+There are two ways to install the brain in your project. Embedded: the `brain` folder lives directly in your repo, and its changes are committed alongside commits on the project. Sibling: the `brain` folder is committed _beside_ you repo and you manage commits, etc into the brain separately. In truth your coding agent is managing those commits, so the day-to-day work will feel functionally identical to you. As a rule of thumb, use embedded for projects where you don't mind the decision making riding along with the project (like this repo). Use sibling every other time: when working in a repo you don't fully control, a repo where you don't want the decision making shipping along with the code, or you want the `brain` to track your knowledge separately and not the knowledge of your whole team. More on each approach below:
 
 **Embedded (`<repo>/brain/`) is the default**, because versioning the record in
 the same repository as the code is the only thing that makes "this decision was
@@ -112,45 +106,34 @@ out.
 
 ### Updating the brain
 
-From time to time I make updates to the core infrastructure of this brain and
-how it works. This section is how you take those changes.
-
 The brain splits into the generic half (`bin/`, `skills/`, `hooks/`, `docs/`,
 `.github/`, and the templates under
 `knowledge-catalog/reference/agent-skills/`) and your half (the rest of
 `knowledge-catalog/`, `tasks/`, `plans/`, `brief/`, `work/`, `config.md`,
-`facts.md`). Upstream only ever changes the generic half, with no remotes and
-no subtree.
+`facts.md`). Upstream only ever changes the generic half.
+
+To update:
 
 ```bash
 brain/bin/update --from https://github.com/<you>/brain.git
 brain/bin/update --list        # exactly what counts as generic
 ```
 
-**If your brain has no `bin/update`**, which is the likely case precisely
-because it is old enough to need updating, bootstrap from a template checkout
-and point it at your install:
-
-```bash
-git clone https://github.com/<you>/brain.git /tmp/brain-template
-/tmp/brain-template/bin/update --target /path/to/your/project/brain
-```
+If you haven't forked, you can use this repo's url as the `--from` url. 
 
 `bin/update` reports what changed by hashing the tree before and after itself,
 rather than by listing what it meant to do. That report was wrong in both
 directions for three releases, because three transforms run after the copy and
 none of them appeared in the list.
 
-## Getting started
+## Getting started: /grill-change
 
 The best way to start is with a proposal you want stress-tested, so reach for
 `/grill-change` and try to build something new. It works the way the grill-me
 prompts you have already seen do, asking you a lot of questions about what you
-want to build, except that it pushes back out of your own brain. The challenges
-come from the decisions you have already recorded rather than from the model's
-imagination, and every one of them cites a path so you can check it.
+want to build, except that it leverage your brain to assist with the task. This skill will cite nodes in the brain that support or refute your proposal, and will use the brain to provide defaults to /grill-changes's questions.
 
-From there you can follow the skill path all the way to a built feature,
+Once the grill skill is finished, you can follow the skill path all the way to a built feature,
 writing a plan and specs on the way when the work has a planning phase. At the
 end, `/spec-review` traverses the brain backwards from what you built to the
 intent that asked for it, so you can see whether what you built matches what
@@ -159,8 +142,8 @@ brain directly rather than change anything.
 
 ### Day one, building something
 
-Say `INIT.md` gave you one goal: *the list page loads in under a second*
-(`G0001`). You want to cache the permission lookup.
+Consider a simple goal: *the list page loads in under a second*
+(`G0001`). To implement this goal, you want to cache a server-side permission lookup.
 
 Start with the proposal rather than with the spec:
 
@@ -235,10 +218,11 @@ Ancestry of T0001-cache-permission-lookups-for-the-life.md
                 session may carry a user id, never the rights it implies.
 ```
 
-That `terminates at:` line is the one to read. It means the work has a recorded
+Notice that your agent is giving you justification (or contradiction) for what you want based on traversal and usage of the brain. This is the power of the brain: it uses your prior intents and actions to contextualize your current change and help, the implemented, decide if the change is correct. 
+
+The `terminates at:` line is one way the brain does this. It means the work has a recorded
 intent to be checked against. If the line says `⚠ UNTERMINATED`, nothing
-upstream explains why this is being built, which is a finding rather than a
-formality.
+upstream explains why this is being built, which is a finding in and of itself.
 
 Then `/spec-review`, which walks the same chain backwards, asks whether what
 shipped still serves the intent, lists the upstream documents the build made
@@ -265,11 +249,9 @@ Brain hits for: hold the cache in process memory between requests
         reaches a user as stale data at random.”
 ```
 
-The exact proposal, already rejected, with the reason, found in the
-*Alternatives* section where the reasoning usually lives. The hit carries a
-line number, so you open the file at the paragraph rather than at the top.
-And because the decision declared what it governs, you can come at it from the
-file instead of from the words:
+The exact proposal, already rejected, with the reason. 
+
+You can also work from the code level:
 
 > which decisions govern app/cache/RequestCache.php?
 
@@ -285,8 +267,7 @@ file instead of from the words:
 ```
 
 `/grill-change` puts that constraint to you with the path attached, so you can
-check the claim rather than take its word. **Two exits, and "noted" isn't one
-of them.** Amend `D0002` on the record, or proceed against it with the id
+check the claim rather than take its word. No you can decide whether to amend `D0002` on the record, or proceed against it with the id
 logged so the next reader finds a deliberate exception instead of an accident.
 
 That is the whole return on day one's bookkeeping, and it is why the first pass
