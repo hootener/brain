@@ -218,7 +218,7 @@ Ancestry of T0001-cache-permission-lookups-for-the-life.md
                 session may carry a user id, never the rights it implies.
 ```
 
-Notice that your agent is giving you justification (or contradiction) for what you want based on traversal and usage of the brain. This is the power of the brain: it uses your prior intents and actions to contextualize your current change and help, the implemented, decide if the change is correct. 
+Notice that your agent is giving you justification (or contradiction) for what you want based on traversal and usage of the brain. This is the power of the brain: it uses your prior intents and actions to contextualize your current change and help you, the implementor, decide if the change is correct. 
 
 The `terminates at:` line is one way the brain does this. It means the work has a recorded
 intent to be checked against. If the line says `⚠ UNTERMINATED`, nothing
@@ -249,7 +249,7 @@ Brain hits for: hold the cache in process memory between requests
         reaches a user as stale data at random.”
 ```
 
-The exact proposal, already rejected, with the reason. 
+This is the exact proposal, already rejected, with the reason. A human or agent can read this and decide next steps accordingly.
 
 You can also work from the code level:
 
