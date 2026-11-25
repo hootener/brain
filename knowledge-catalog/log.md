@@ -2,6 +2,10 @@
 
 Newest first. `**Creation**` / `**Update**` / `**Supersession**`.
 
+## 2026-11-25
+
+**Update** — [E0001](reference/E0001-brain-in-practice.md) Five defects in the relocation step, found by a greenfield adoption that `doctor` called sound and `selftest` passed
+
 ## 2026-11-11
 
 **Creation** — [G0002](goals/G0002-the-brain-returns-more-than-it-costs-to.md) The brain returns more than it costs to keep

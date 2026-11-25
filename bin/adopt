@@ -101,13 +101,37 @@ def say(line):
     print(line)
 
 
-def source_revision():
+def source_revision(override=None):
     """The upstream commit this brain's generic half came from.
 
     Without it there is no way to tell what you are running or whether an
     update landed; the first re-adopter diffed two trees by hand to find that
     a file had stopped existing.
+
+    **Only this brain's own `.git` can answer.** `git -C <dir>` walks *up*
+    when `<dir>` is not itself a repository, and in embedded mode — the
+    documented default — the brain never is: INIT.md deletes the clone's
+    `.git` before calling us. So the question "which brain commit is this"
+    came back with the adopter's own project commit: a hash that is not in the
+    upstream repository at all, written into `config.md`, printed by
+    `bin/doctor` as `upstream:` and believed by `bin/update`.
+
+    An empty field is a question a reader knows to ask. A plausible wrong hash
+    is an answer, and the costly half of D0001 — the reader stops looking.
+
+    So the toplevel is checked rather than assumed, and when the repository
+    git finds is not this brain there is no revision here to report. The
+    caller is the only one still holding the evidence, because it cloned the
+    template before deleting its `.git` — hence `--revision`.
     """
+    if override:
+        return override.strip()
+    top = subprocess.run(['git', '-C', BRAIN, 'rev-parse', '--show-toplevel'],
+                         capture_output=True, text=True)
+    if top.returncode != 0 or not top.stdout.strip():
+        return ''
+    if os.path.realpath(top.stdout.strip()) != os.path.realpath(BRAIN):
+        return ''
     r = subprocess.run(['git', '-C', BRAIN, 'rev-parse', '--short', 'HEAD'],
                        capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else ''
@@ -202,7 +226,7 @@ def stamp_dates(dry):
         say(f'  ~ stamped {today} into {len(hit)} file(s)')
 
 
-def write_config(mode, repos, dry):
+def write_config(mode, repos, dry, revision=None):
     path = os.path.join(BRAIN, 'config.md')
     text = open(path, encoding='utf-8').read()
     text = re.sub(r'^mode: .*$', f'mode: {mode}', text, count=1, flags=re.M)
@@ -210,7 +234,17 @@ def write_config(mode, repos, dry):
     # It described this install but carried the template's authoring date.
     text = re.sub(r'^timestamp: ".*"$', f'timestamp: "{date.today().isoformat()}"',
                   text, count=1, flags=re.M)
-    rev = source_revision()
+    rev = source_revision(revision)
+    if not rev:
+        # Said out loud, because the alternative to saying it was writing a
+        # hash that looked like an answer. `--revision` is how the caller that
+        # still has the clone hands over what only it can see.
+        say('  · brain_revision: unrecorded. This brain has no `.git` of its '
+            'own, and the')
+        say('    host\'s commits say nothing about which brain it is. Pass '
+            '`--revision <sha>`')
+        say('    to record it — INIT.md reads it off the clone before deleting '
+            'that `.git`.')
     if rev:
         if re.search(r'^brain_revision:', text, re.M):
             text = re.sub(r'^brain_revision: .*$', f'brain_revision: "{rev}"',
@@ -285,9 +319,16 @@ def move_example(bare, dry, already_adopted=False):
 
     listed = [l.strip() for l in open(record, encoding='utf-8')
               if l.strip() and not l.startswith('#')]
+    owned = template_md_names(listed)
     for rel in listed:
         src = os.path.join(BRAIN, rel)
         if not os.path.exists(src):
+            continue
+        if os.path.basename(rel) == 'log.md' and not log_is_templates(src, owned):
+            # The one file in the template's record that the adopter also
+            # writes to, at the same path. See log_is_templates.
+            say(f'  = {rel} cites nodes that are not the template\'s — '
+                f'left alone')
             continue
         moved.append(rel)
         if dry:
@@ -318,9 +359,22 @@ def move_example(bare, dry, already_adopted=False):
                 continue
             os.makedirs(os.path.dirname(path), exist_ok=True)
             open(path, 'w', encoding='utf-8').write(body)
-        repoint_to_example(moved)
-        if bare and os.path.isdir(dest):
-            shutil.rmtree(dest)
+        if bare:
+            # Rewriting citations *into* `example/` and then deleting
+            # `example/` left all 23 of them dangling on a documented flag —
+            # the rewrite and the removal each did exactly what they say, in
+            # an order where the first is undone by the second.
+            #
+            # `point_citations_upstream` is already the answer for "there is
+            # no example/ to point into", which is precisely what `--bare`
+            # asks for. It just was not reached, because the branch that
+            # chooses it keys on nothing having been moved, and under `--bare`
+            # everything is moved and then thrown away.
+            if os.path.isdir(dest):
+                shutil.rmtree(dest)
+            point_citations_upstream()
+        else:
+            repoint_to_example(moved)
 
     if moved:
         say(f'  → {"removed" if bare else "moved to example/"}: '
@@ -420,6 +474,52 @@ def point_citations_upstream():
         say('  = generic citations already point upstream — nothing to rewrite')
 
 
+def template_md_names(listed):
+    """Every `.md` basename the manifest claims, directory entries expanded.
+
+    Read off the live tree before anything moves, so the set is the same
+    whatever order the manifest happens to list its entries in.
+    """
+    names = set()
+    for rel in listed:
+        p = os.path.join(BRAIN, rel)
+        if rel.endswith('.md'):
+            names.add(os.path.basename(rel))
+        elif os.path.isdir(p):
+            for base, _dirs, files in os.walk(p):
+                names.update(f for f in files if f.endswith('.md'))
+    return names
+
+
+def log_is_templates(path, owned):
+    """Is this change log the template's own, or has somebody written in it?
+
+    The log is the one file in the template's record that an adopter also
+    writes to, at the same path, so identity alone cannot settle it. A brain
+    migrating from another brain arrives carrying years of its own entries
+    here, and resetting that once took a 12,339-byte log down to 97 — which
+    that brain survived only because a permission layer refused the command.
+
+    The manifest settles it anyway, without reading the prose. **Every entry
+    in a change log cites the node it is about**, so a log whose citations
+    name only nodes the manifest is relocating is the template's own; one
+    citation pointing anywhere else means somebody has written here, and it
+    stays. A log citing nothing at all stays too: there is no evidence either
+    way, and the safe direction is obvious.
+
+    This is D0011's preference applied to the thing it warns about. The field
+    it replaces asked whether the file "has content", which is true of the
+    template's log on every single install — so the guard protected the wrong
+    file 100% of the time in the one case it was reached. An inference fails
+    as a confident wrong answer; this fails as absence, and absence is
+    reportable.
+    """
+    text = open(path, encoding='utf-8').read()
+    cited = [os.path.basename(m) for m in
+             re.findall(r'\]\(([^)\s]+\.md)\)', text)]
+    return bool(cited) and all(c in owned for c in cited)
+
+
 def has_content(path, rel):
     """Is there anything here a person wrote that a reset would destroy?
 
@@ -446,6 +546,56 @@ def has_content(path, rel):
     return any(f in text for f in present) or 'index.md' not in rel and bool(present)
 
 
+def relocated_md_paths(moved):
+    """Where every `.md` file the relocation moved *used to* live.
+
+    Paths relative to the brain, because the rewrite used to match on
+    **basename** and a basename is not an identity. Two bugs, one cause:
+
+    `.template-record` names directories as well as files — `tasks/formalize`
+    is the template's own backlog — and a directory does not end in `.md`, so
+    the set was built from the file entries alone and every node inside a
+    directory was missing from it. A citation of one kept pointing where the
+    file no longer was, and `bin/lint` reported it on a clean install under the
+    wording *"fine if it marks future work"* — which is what that warning
+    means when a person wrote the link. The relocation bug arrived wearing the
+    costume of a deliberate marker.
+
+    Expanding those directories by basename then broke the other direction.
+    Every moved initiative carries an `index.md`, so `index.md` entered the
+    set and *six* citations of entirely unrelated indexes — `../plans/index.md`,
+    `knowledge-catalog/reference/agent-skills/index.md` — were redirected into
+    `example/`, where they resolve to nothing. An index is navigation that
+    belongs to its folder, which is why they are not relocated in the first
+    place; matching them by name undid that on the way back out.
+
+    A path collides with nothing, so neither failure is reachable from here.
+
+    `knowledge-catalog/log.md` is the one deliberate exclusion. It travels
+    into `example/` with the record it describes, but `howto.md` cites
+    `[log.md](log.md)` and means *the adopter's*, which `adopt` recreates empty
+    at that same path. Rewriting that would point the one document explaining
+    the change log at somebody else's.
+    """
+    dest = os.path.join(BRAIN, 'example')
+    paths = set()
+    for rel in moved:
+        if rel.endswith('.md'):
+            paths.add(os.path.normpath(rel))
+            continue
+        here = os.path.join(dest, rel)
+        for base, _dirs, files in os.walk(here):
+            for f in files:
+                if not f.endswith('.md'):
+                    continue
+                # Named by where it was, not where it now is, so a citation
+                # written against the original tree can be looked up directly.
+                paths.add(os.path.normpath(os.path.join(
+                    rel, os.path.relpath(os.path.join(base, f), here))))
+    paths.discard(os.path.normpath('knowledge-catalog/log.md'))
+    return paths
+
+
 def repoint_to_example(moved):
     """Rewrite links that pointed at the record we just moved.
 
@@ -466,7 +616,7 @@ def repoint_to_example(moved):
     **It must be idempotent.** Run twice, it produced `example/example/` in
     twelve generic files and took lint from three warnings to twelve.
     """
-    names = {os.path.basename(m) for m in moved if m.endswith('.md')}
+    names = relocated_md_paths(moved)
     if not names:
         # Nothing was relocated, which means the template's own record was
         # never here — a brain migrating from another brain. The generic
@@ -503,12 +653,16 @@ def repoint_to_example(moved):
                     link = m.group(1)
                     # Already pointing into example/: leave it. This is what
                     # makes a second run a no-op instead of a nesting.
-                    if 'example/' in link or os.path.basename(link) not in names:
+                    if 'example/' in link:
                         return m.group(0)
-                    target = os.path.normpath(os.path.join(
-                        BRAIN, 'example',
-                        os.path.relpath(os.path.normpath(
-                            os.path.join(os.path.dirname(path), link)), BRAIN)))
+                    # Resolve the citation to a path and look *that* up. By
+                    # basename, every `index.md` in the brain matched the one
+                    # inside a relocated initiative.
+                    rel = os.path.normpath(os.path.relpath(os.path.normpath(
+                        os.path.join(os.path.dirname(path), link)), BRAIN))
+                    if rel not in names:
+                        return m.group(0)
+                    target = os.path.normpath(os.path.join(BRAIN, 'example', rel))
                     changed = True
                     return '](%s)' % os.path.relpath(target, os.path.dirname(path))
 
@@ -579,6 +733,10 @@ def main():
     ap.add_argument('--with-ci', action='store_true', help='install the Actions workflow')
     ap.add_argument('--bare', action='store_true',
                     help="delete the template's own record instead of keeping it as example/")
+    ap.add_argument('--revision', metavar='SHA',
+                    help='the upstream commit this brain was copied from; the '
+                         'caller is the only one that can still see it once '
+                         "the clone's .git is gone")
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--repoint-only', action='store_true',
                     help='re-apply the example/ link rewrite and stop; for after an update')
@@ -629,9 +787,29 @@ def main():
             and os.path.isdir(os.path.join(host, d, '.git')))
 
     already = cfg_mode() != 'template'
-    existing = sum(1 for base, d, fs in os.walk(os.path.join(BRAIN, 'knowledge-catalog'))
-                   for f in fs if re.match(r'^[GDE]\d{4}-', f)) \
-        if os.path.isdir(os.path.join(BRAIN, 'knowledge-catalog')) else 0
+    # The template's own nodes do not make the adopter's catalog populated.
+    # Counting every `[GDE]dddd-` file under `knowledge-catalog/` counted the
+    # 19 this install is about to relocate, so every clean install opened by
+    # telling the adopter their catalog was being left alone — and the one
+    # state the warning exists for became indistinguishable from the default.
+    # The manifest already knows which nodes are not theirs.
+    record = os.path.join(BRAIN, '.template-record')
+    ours = set()
+    if os.path.isfile(record):
+        ours = {l.strip() for l in open(record, encoding='utf-8')
+                if l.strip() and not l.startswith('#')}
+    kc = os.path.join(BRAIN, 'knowledge-catalog')
+    existing = 0
+    if os.path.isdir(kc):
+        for base, d, fs in os.walk(kc):
+            for f in fs:
+                if not re.match(r'^[GDE]\d{4}-', f):
+                    continue
+                rel = os.path.relpath(os.path.join(base, f), BRAIN)
+                if rel in ours or any(
+                        rel.startswith(o.rstrip('/') + os.sep) for o in ours):
+                    continue
+                existing += 1
     if existing and not already:
         print(f'  ! This brain already holds {existing} node(s). Adopting into it is a')
         print('    migration, not an install: your catalog, log and indexes are left')
@@ -641,7 +819,7 @@ def main():
     link_skills(mode, dry)
     install_hook(mode, dry)
     stamp_dates(dry)
-    write_config(mode, repos, dry)
+    write_config(mode, repos, dry, args.revision)
     move_example(args.bare, dry, already)
     offer_ci(mode, args.with_ci, dry)
 
