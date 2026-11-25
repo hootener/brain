@@ -1392,3 +1392,94 @@ repository would have hit exactly that, and read it as a defect in their
 install. Skip when the precondition is absent, fail when the assertion is
 false — eighth time that rule has been applied, and the first time it was
 caught by a scratch fixture rather than by somebody else's report.
+
+## 2026-11-25 — five defects in the relocation, found by adopting it again
+
+A greenfield embedded install into a new project (`makase`), done to dogfood
+the brain on a project about the brain. `bin/doctor` came back **sound** and
+`bin/selftest` was **green at 157 checks** through all five. Every one is in
+the step that moves the template's own record into `example/`.
+
+They share a cause worth naming, because it is not carelessness and it will
+recur. **`bin/adopt` knows exactly which paths it is relocating — it prints
+the count — and four of the five defects come from re-deriving that set by
+some other means than reading it.** A manifest existed, was correct, and was
+consulted for the move and then abandoned for everything downstream of it.
+
+| | the derivation used instead | what it cost |
+|---|---|---|
+| the link rewrite | `basename(m) for m in moved if m.endswith('.md')` | directories in the manifest contributed nothing, so a citation of a node inside `tasks/formalize` dangled |
+| the change log | "does this file have content" | true of the template's log on every install, so it was protected in the one case it should not have been |
+| the migration banner | every `[GDE]dddd-` file under `knowledge-catalog/` | counted the 19 nodes about to be relocated, so every clean install announced itself as a migration |
+| `--bare` | citations rewritten into `example/`, then `example/` deleted | 23 dangling links on a documented flag |
+
+### The one that matters most is the one that looked benign
+
+`brain_revision` came out empty, which reads as a cosmetic miss. It is not.
+`source_revision()` ran `git -C <brain> rev-parse --short HEAD`, and **`git -C`
+walks up when the directory is not itself a repository** — which in embedded
+mode, the documented default, it never is, because `INIT.md` deletes the
+clone's `.git` two lines before calling `adopt`.
+
+So in a host that *has* commits, the field recorded the adopter's own project
+commit: `7dd3f0c` where the brain was `218a557`. A hash that is not in this
+repository at all, written into `config.md`, printed by `bin/doctor` as
+`upstream:`, and believed by `bin/update`. The empty case only appeared here
+because the host had not committed yet.
+
+This is the expensive half of [D0001](../decisions/D0001-claims-must-be-checkable.md)
+exactly: an absent note costs a reader a lookup, a confident wrong one costs
+them the lookup they would have done. And `config.md`'s own prose already
+said why the field exists — *"the first re-adopter had to diff two trees by
+hand"* — which is the state the default install reproduced.
+
+**The check that was watching asserted the field was non-empty.** So the wrong
+value satisfied it, and `install()` in `bin/selftest` had been git-initting and
+*committing* its throwaway host since it was written, which is what made the
+host's HEAD available to be picked up. The suite was not merely failing to
+catch this; it was manufacturing the condition.
+
+Eighth instance of a rule this record already carries, and the first time it
+bit in the opposite direction: the entry above dated 2026-11-11 met this same
+`git rev-parse` behaviour, found nothing to record because the scratch copy had
+no `.git`, and filed it as a **missing precondition for the fixture**. It was
+the defect, seen from the side where it is harmless. *Skip when the
+precondition is absent* was the right rule and the wrong diagnosis — the
+precondition was absent because the product deletes it.
+
+### A warning count is not a warning
+
+`bin/lint` reported the dangling citation on a clean install, and
+`install()`'s guard — *"the install adds no warnings of its own"* — passed
+anyway. The baseline carried one warning (a stale `graph.html`) and the
+install produced one (the dangling link), **so the totals matched while the
+warning underneath them changed identity.** A count was standing in for a set.
+
+Worse, the text it printed was `fine if it marks future work`, which is what
+an unresolved link means when a person wrote one deliberately. The relocation
+bug arrived wearing the costume of a feature, past a gate that agreed with it.
+Now checked as *no unresolved link at all, whatever the count does*.
+
+### What D0011 was right about
+
+[D0011](../decisions/D0011-a-change-that-reads-the-adopter-s-corpus.md) says to
+prefer an explicit marker over an inference, because **an inference fails as a
+confident wrong answer and a marker fails as absence, which is reportable.**
+The change log is the case: `has_content` asked a question about the file and
+got a true answer to the wrong question. The manifest answers the right one —
+*is this log citing anything that is not the template's?* — and when it cannot
+tell, the log stays and `adopt` says why.
+
+The log is also now relocated rather than reset, which was not the obvious
+fix and is the better one: it travels with the nodes it cites, so every
+relative link in it resolves inside `example/` **without a single rewrite.**
+
+D0011 also asked for a corpus that is not this one, and the new fixtures use
+`synthetic_brain()` with a *planted* template record — two nodes, an
+initiative directory, a generic document citing into it, and a log citing
+both. Without the planting the manifest names nothing present, the relocation
+is a no-op, and all eighteen checks pass against a tree `adopt` never touched:
+the fixture satisfying the thing it measures, which is the failure D0011 is
+about, one level up.
+
+157 checks to 178.

@@ -54,9 +54,18 @@ with, which is the entire point of embedding it.
 cd <project> && git init             # if it is not a repo yet. adopt requires one
 git clone https://github.com/hootener/brain.git /tmp/brain-template
 cp -R /tmp/brain-template brain
+REV=$(git -C /tmp/brain-template rev-parse --short HEAD)   # before the next line
 rm -rf brain/.git                    # the important line
-brain/bin/adopt                      # add --with-ci to install the workflow
+brain/bin/adopt --revision "$REV"    # add --with-ci to install the workflow
 ```
+
+**`REV` has to be read before the `rm`, and only you can read it.** Once the
+clone's `.git` is gone nothing in the brain knows which commit it came from —
+`git -C brain rev-parse HEAD` walks *up* and answers about the host, so
+`brain_revision` recorded the adopter's own project commit: a hash that is not
+in this repository at all, printed by `bin/doctor` as `upstream:` and believed
+by `bin/update`. Omit `--revision` and the field stays empty, which `adopt`
+tells you it is doing.
 
 **Sibling.** Here a clone is right, because the brain *is* the repository.
 

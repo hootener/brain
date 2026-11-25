@@ -150,6 +150,14 @@ def install(tmp, verbose):
             continue
         if any(m and m in line for m in moved):
             relocated += 1
+    # Counting is what let a relocation bug through. The baseline carried one
+    # warning (a stale graph) and the install produced one (a citation of a
+    # node it had just moved), so the totals matched and the check passed
+    # while the warning underneath it had changed identity. A fresh install
+    # must leave *no* unresolved link, whatever the count does.
+    unresolved = [l for l in out.split('\n') if 'does not resolve' in l]
+    check('a fresh install leaves no unresolved link, whatever the count',
+          not unresolved, unresolved[:3])
     check('the install adds no warnings of its own',
           warns - relocated <= baseline,
           f'{warns} warnings ({relocated} about relocated nodes) against a '
@@ -1899,6 +1907,310 @@ def regressions(brain, verbose):
     run([B('bin', 'graph-build')], brain)
 
 
+
+def _planted_template(prefix):
+    """A synthetic brain carrying a *synthetic* template record.
+
+    `synthetic_brain()` writes no template nodes, so `.template-record` names
+    nothing that is there, the relocation is a no-op, and every check below
+    would pass against a tree `adopt` never touched — the fixture satisfying
+    the thing it means to measure, which is the failure D0011 is about. So the
+    record is planted here: one decision, one task inside an initiative
+    *directory*, a generic document citing that task, and the change log that
+    cites both. The shape of the real manifest, with none of this brain's
+    content.
+
+    **The directory entry is the point.** `.template-record` names
+    `tasks/formalize` alongside individual files, and a directory does not end
+    in `.md`.
+    """
+    brain = synthetic_brain(prefix)
+    kc = os.path.join(brain, 'knowledge-catalog')
+
+    open(os.path.join(kc, 'decisions', 'D0001-planted.md'), 'w').write(
+        '---\nid: D0001\ntype: decision\ntitle: "Planted"\n'
+        'description: "The template ships this one."\n'
+        'timestamp: "2024-03-01"\ntags: []\nstatus: active\n'
+        'invariant: "Planted."\nconstrains:\n  - bin/*\n---\n'
+        '# Context\nx\n# Decision\nx\n# Alternatives\nx\n# Consequences\nx\n')
+
+    os.makedirs(os.path.join(brain, 'tasks', 'planted'), exist_ok=True)
+    open(os.path.join(brain, 'tasks', 'planted', 'T0001-planted.md'), 'w').write(
+        '---\nid: T0001\ntype: task\ntitle: "Planted task"\n'
+        'description: "d"\nstatus: Complete\ninitiative: planted\n'
+        'blocked_by: []\ntimestamp: "2024-02-01"\ntags: []\n---\n'
+        '# What to build\nx\n# Acceptance criteria\n- [x] x\n'
+        '# Out of scope\n- x\n# Log\n')
+
+    # An index inside the relocated directory, and unrelated ones outside it.
+    # The relocated initiative really does carry an index — that is what put
+    # `index.md` in reach of a basename match — and the citations that got
+    # dragged along with it were these.
+    open(os.path.join(brain, 'tasks', 'planted', 'index.md'), 'w').write(
+        '# planted\n\n* [T0001](T0001-planted.md)\n')
+    os.makedirs(os.path.join(brain, 'plans'), exist_ok=True)
+    open(os.path.join(brain, 'plans', 'index.md'), 'w').write('# Plans\n\nNone.\n')
+    open(os.path.join(kc, 'index.md'), 'w').write(
+        '# Catalog\n\n* [Plans](../plans/index.md)\n'
+        '* [Decisions](decisions/index.md)\n')
+    open(os.path.join(kc, 'decisions', 'index.md'), 'w').write(
+        '# Decisions\n\n* [D0001](D0001-planted.md)\n')
+
+    open(os.path.join(brain, '.template-record'), 'w').write(
+        "# The planted record.\n"
+        'knowledge-catalog/decisions/D0001-planted.md\n'
+        'knowledge-catalog/log.md\n'
+        'tasks/planted\n')
+
+    # A generic document citing the node *inside* the directory entry. This is
+    # the citation the rewrite has to redirect, and the one it was silently
+    # dropping.
+    open(os.path.join(brain, 'CLAUDE.md'), 'w').write(
+        '# Generic\n\nThe tracker convention comes from '
+        '[T0001](tasks/planted/T0001-planted.md).\n')
+
+    # The log the template ships. One citation sits inside the directory
+    # entry, which is the one that dangled on every clean install.
+    open(os.path.join(kc, 'log.md'), 'w').write(
+        '# Change log\n\nNewest first.\n\n## 2026-01-01\n\n'
+        '**Creation** — [D0001](decisions/D0001-planted.md) Planted\n\n'
+        '**Creation** — [T0001](../tasks/planted/T0001-planted.md) Planted task\n')
+
+    return brain
+
+
+def _commit_host(brain):
+    """Make the brain's parent a committed git repository, embedded-style.
+
+    Embedded is the documented default and the only mode in which the brain
+    carries no `.git` of its own — which is exactly what makes `git -C brain`
+    walk *up* and answer about the host. Sibling cannot show it, because there
+    the brain is the repository.
+    """
+    host = os.path.dirname(brain)
+    subprocess.run(['git', 'init', '-q', host], capture_output=True)
+    open(os.path.join(host, 'README.md'), 'w').write('# host\n')
+    subprocess.run(['git', 'add', '-A'], cwd=host, capture_output=True)
+    subprocess.run(['git', '-c', 'user.email=t@t', '-c', 'user.name=t',
+                    'commit', '-qm', 'host'], cwd=host, capture_output=True)
+    r = subprocess.run(['git', '-C', host, 'rev-parse', '--short', 'HEAD'],
+                       capture_output=True, text=True)
+    return host, r.stdout.strip()
+
+
+def relocation(brain, verbose):
+    """The template's record leaving the adopter's catalog, and what it drags.
+
+    Four defects, all found by adopting the brain into a real project rather
+    than by this suite, which was green through every one of them. They share
+    a cause worth naming: `adopt` knows exactly which paths it is relocating —
+    it prints the count — and three of the four re-derived that set by some
+    other means than reading it.
+    """
+    # ---- the manifest's directory entries reach the link rewrite ----------
+    #
+    # `repoint_to_example` built its rewrite set as
+    # `{basename(m) for m in moved if m.endswith('.md')}`, and
+    # `.template-record` names directories too. So every node inside
+    # `tasks/formalize` was absent from the set, and a citation of one was
+    # left pointing where the file no longer was.
+    #
+    # It surfaced as `bin/lint` reporting an unresolved link on a clean
+    # install — under the wording "fine if it marks future work", which is
+    # what the warning means when a person wrote it. A relocation bug arrived
+    # wearing the costume of a deliberate marker.
+    p = _planted_template('brain-reloc-')
+    _commit_host(p)
+    _, out = run([os.path.join(p, 'bin', 'adopt')], p)
+    if verbose:
+        print(out)
+    generic = open(os.path.join(p, 'CLAUDE.md')).read()
+    check('reloc · a citation of a node inside a relocated directory is rewritten',
+          'example/tasks/planted/T0001-planted.md' in generic,
+          generic.strip()[-160:])
+    # Scoped to the relocation. `synthetic_brain()` copies the real
+    # `howto.md`, which cites this brain's own decisions and finds none of
+    # them here — a fixture condition, not the subject, and asserting on the
+    # whole lint output measured the former.
+    _, lint = run([os.path.join(p, 'bin', 'lint')], p)
+    dangling = [l for l in lint.split('\n')
+                if 'does not resolve' in l and 'planted' in l]
+    check('reloc · and no citation of a relocated node is left dangling',
+          not dangling, dangling[:2])
+
+    # Expanding those directories by *basename* is how the first attempt at
+    # the above broke the other direction. Every relocated initiative carries
+    # an `index.md`, so `index.md` entered the rewrite set and six citations
+    # of unrelated indexes — `../plans/index.md` among them — were redirected
+    # into `example/`, where nothing is. An index belongs to its folder, which
+    # is why it is not relocated; matching by name undid that on the way out.
+    kc_index = open(os.path.join(p, 'knowledge-catalog', 'index.md')).read()
+    check('reloc · an unrelated index is not dragged in by its basename',
+          'example/' not in kc_index,
+          [l for l in kc_index.split('\n') if 'example/' in l][:2])
+
+    # ---- the template's change log is part of the template's record -------
+    #
+    # `EMPTY_INDEXES` always meant to hand the adopter a fresh log; the guard
+    # in front of it asks `has_content`, which is true of the template's log
+    # on every install, so it was protected from being reset 100% of the time
+    # in the one case it should not have been. The adopter inherited a change
+    # log whose every line is about somebody else's project.
+    #
+    # Moving it rather than resetting it is what makes its citations survive:
+    # the log travels with the nodes it cites, so `decisions/D0001-planted.md`
+    # resolves inside `example/` without a single rewrite.
+    log = open(os.path.join(p, 'knowledge-catalog', 'log.md')).read()
+    check("reloc · the adopter's change log starts empty",
+          'Planted' not in log, log.strip()[:200])
+    moved_log = os.path.join(p, 'example', 'knowledge-catalog', 'log.md')
+    check("reloc · and the template's own log is kept in example/",
+          os.path.isfile(moved_log) and 'Planted' in open(moved_log).read(),
+          moved_log)
+    check("reloc · whose citations resolve where it now sits",
+          os.path.isfile(os.path.join(p, 'example', 'knowledge-catalog',
+                                      'decisions', 'D0001-planted.md')))
+    # howto.md cites `[log.md](log.md)` and means the adopter's, so the log
+    # must not join the rewrite set on its way out.
+    check('reloc · a generic citation of log.md still means the adopter\'s',
+          'example/knowledge-catalog/log.md' not in open(
+              os.path.join(p, 'knowledge-catalog', 'howto.md')).read())
+
+    # ---- a fresh install is not a migration -------------------------------
+    #
+    # The banner counted every `[GDE]dddd-` file under `knowledge-catalog/`,
+    # which on the unadopted template is the template's own 19 — the very
+    # nodes the next step relocates. So the tool opened every clean install by
+    # telling the adopter their catalog was being left alone, and the one
+    # state the message exists to warn about was indistinguishable from the
+    # default one.
+    check('reloc · a fresh install is not announced as a migration',
+          'migration, not an install' not in out, out[:400])
+    shutil.rmtree(os.path.dirname(p), ignore_errors=True)
+
+    # ---- but a populated catalog still is ---------------------------------
+    q = _planted_template('brain-reloc-mig-')
+    open(os.path.join(q, 'knowledge-catalog', 'decisions', 'D0500-theirs.md'),
+         'w').write(
+        '---\nid: D0500\ntype: decision\ntitle: "Theirs"\ndescription: "x"\n'
+        'timestamp: "2024-03-01"\ntags: []\nstatus: active\n---\n'
+        '# Context\nx\n# Decision\nx\n# Alternatives\nx\n# Consequences\nx\n')
+    _commit_host(q)
+    _, out_q = run([os.path.join(q, 'bin', 'adopt')], q)
+    check('reloc · a catalog holding a node of the adopter\'s own still is',
+          'migration, not an install' in out_q, out_q[:400])
+    check('reloc · and the count names only their nodes, not the template\'s',
+          'already holds 1 node(s)' in out_q,
+          [l for l in out_q.split('\n') if 'holds' in l][:1])
+    shutil.rmtree(os.path.dirname(q), ignore_errors=True)
+
+    # ---- a log somebody else has written in is left alone -----------------
+    #
+    # The protection this must not undo: a first adopt into a brain migrating
+    # from another one took a 12,339-byte change log down to 97, and that
+    # brain survived only because a permission layer refused the command.
+    # Identity alone cannot settle the log, because it is the one file in the
+    # template's record that an adopter also writes to, at the same path.
+    #
+    # The manifest settles it anyway. Every entry in a change log cites the
+    # node it is about, so a log citing only nodes the manifest is relocating
+    # is the template's; one citation pointing anywhere else means somebody
+    # has written here. An inference fails as a confident wrong answer; this
+    # fails as absence, and absence is reportable (D0011).
+    m = _planted_template('brain-reloc-log-')
+    open(os.path.join(m, 'knowledge-catalog', 'log.md'), 'a').write(
+        '\n**Creation** — [D0500](decisions/D0500-theirs.md) Years of prose\n')
+    open(os.path.join(m, 'knowledge-catalog', 'decisions', 'D0500-theirs.md'),
+         'w').write(
+        '---\nid: D0500\ntype: decision\ntitle: "Theirs"\ndescription: "x"\n'
+        'timestamp: "2024-03-01"\ntags: []\nstatus: active\n---\n'
+        '# Context\nx\n# Decision\nx\n# Alternatives\nx\n# Consequences\nx\n')
+    _commit_host(m)
+    _, out_m = run([os.path.join(m, 'bin', 'adopt')], m)
+    kept = open(os.path.join(m, 'knowledge-catalog', 'log.md')).read()
+    check('reloc · a log citing a node of the adopter\'s own is left alone',
+          'Years of prose' in kept, kept.strip()[-200:])
+    check('reloc · and the reason is reported, not just the fact',
+          'log.md' in out_m and 'left alone' in out_m,
+          [l for l in out_m.split('\n') if 'log.md' in l][:2])
+    shutil.rmtree(os.path.dirname(m), ignore_errors=True)
+
+    # ---- brain_revision is the brain's commit, or nothing -----------------
+    #
+    # `source_revision()` ran `git -C <brain> rev-parse HEAD`. In embedded
+    # mode — the documented default — INIT.md has just deleted the brain's own
+    # `.git`, so git walks up and answers about the *host*. The field that
+    # exists to say which upstream commit you are running recorded the
+    # adopter's own project commit instead: a hash that is not in
+    # hootener/brain at all, printed by `bin/doctor` as `upstream:` and
+    # believed by `bin/update`.
+    #
+    # The empty case is the benign one. This is the confident wrong answer
+    # that D0001 is about, and the test that was watching asserted only that
+    # the field was non-empty, so the wrong value satisfied it.
+    r = _planted_template('brain-reloc-rev-')
+    _, host_rev = _commit_host(r)
+    _, out_r = run([os.path.join(r, 'bin', 'adopt')], r)
+    cfg = open(os.path.join(r, 'config.md')).read()
+    got = re.search(r'^brain_revision: "(.*)"', cfg, re.M)
+    check('reloc · brain_revision is never the host\'s commit',
+          got is not None and got.group(1) != host_rev,
+          f'recorded {got and got.group(1)!r}, host is {host_rev!r}')
+    check('reloc · and an unknown revision is reported rather than guessed',
+          'revision' in out_r.lower(),
+          [l for l in out_r.split('\n') if 'revision' in l.lower()][:2])
+    shutil.rmtree(os.path.dirname(r), ignore_errors=True)
+
+    # The caller is the only one who can still see the commit, because it is
+    # the one that cloned the template before deleting its `.git`.
+    r2 = _planted_template('brain-reloc-rev2-')
+    _commit_host(r2)
+    run([os.path.join(r2, 'bin', 'adopt'), '--revision', 'deadbee'], r2)
+    cfg2 = open(os.path.join(r2, 'config.md')).read()
+    check('reloc · --revision records what the caller measured',
+          re.search(r'^brain_revision: "deadbee"', cfg2, re.M) is not None,
+          cfg2[:240])
+    _, doc = run([os.path.join(r2, 'bin', 'doctor')], r2)
+    check('reloc · and doctor prints it', 'deadbee' in doc, doc[:240])
+    shutil.rmtree(os.path.dirname(r2), ignore_errors=True)
+
+    # ---- --bare does not rewrite into what it is about to delete ---------
+    #
+    # `--bare` rewrote every citation into `example/` and then deleted
+    # `example/`: 23 dangling links on a documented flag, each step doing
+    # exactly what it says, in an order where the first is undone by the
+    # second. The upstream rewrite was already written for "there is no
+    # example/ to point into" and was simply never reached, because the branch
+    # selecting it keys on nothing having moved — and under `--bare`
+    # everything moves and is then thrown away.
+    b = _planted_template('brain-reloc-bare-')
+    _commit_host(b)
+    run([os.path.join(b, 'bin', 'adopt'), '--bare', '--revision', 'cafe123'], b)
+    _, lint_b = run([os.path.join(b, 'bin', 'lint')], b)
+    stale = [l for l in lint_b.split('\n')
+             if 'example/' in l and 'does not resolve' in l]
+    check('reloc · --bare leaves no citation pointing into the deleted example/',
+          not stale, stale[:2])
+    check('reloc · and example/ is actually gone',
+          not os.path.isdir(os.path.join(b, 'example')))
+    shutil.rmtree(os.path.dirname(b), ignore_errors=True)
+
+    # ---- INIT.md measures it before it destroys the evidence --------------
+    #
+    # A fix in `adopt` that the documented install path cannot feed is not a
+    # fix. INIT.md's embedded recipe deletes `brain/.git` and only then runs
+    # `adopt`, so the revision has to be read off the clone first.
+    init = open(os.path.join(brain, 'INIT.md'), encoding='utf-8').read()
+    emb = init[init.find('**Embedded**'):init.find('**Sibling.**')]
+    rev_read = emb.find('rev-parse')
+    rm_git = emb.find('rm -rf brain/.git')
+    check('reloc · INIT.md reads the revision before deleting the clone\'s .git',
+          rev_read != -1 and rm_git != -1 and rev_read < rm_git,
+          f'rev-parse at {rev_read}, rm at {rm_git}')
+    check('reloc · and passes it to adopt',
+          '--revision' in emb, emb[-400:])
+
+
 def main():
     ap = argparse.ArgumentParser(description='Does a fresh install work, and do the tools survive foreign content?')
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -1914,7 +2226,9 @@ def main():
         # layer, not of the suite's ability to report.
         for label, fn in (('Foreign content', fixture),
                           ('Regressions — one per finding that changed code',
-                           regressions)):
+                           regressions),
+                          ("Relocation — the template's record leaving the "
+                           "adopter's catalog", relocation)):
             print(f'\n{label}')
             try:
                 fn(brain, args.verbose)

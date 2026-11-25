@@ -18,6 +18,7 @@ knowledge-catalog/decisions/D0013-approach-is-optional-and-three-types-carry-the
 knowledge-catalog/decisions/D0014-the-brain-describes-one-repository-and-can-point.md
 knowledge-catalog/goals/G0001-a-brain-others-can-adopt.md
 knowledge-catalog/goals/G0002-the-brain-returns-more-than-it-costs-to.md
+knowledge-catalog/log.md
 knowledge-catalog/reference/E0001-brain-in-practice.md
 knowledge-catalog/reference/E0002-portability-findings.md
 knowledge-catalog/reference/E0003-adoption-greenfield.md

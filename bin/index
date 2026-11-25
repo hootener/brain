@@ -175,6 +175,15 @@ def write_template_record():
     for extra in ('tasks/formalize', 'plans/formalize'):
         if os.path.isdir(os.path.join(ROOT, extra)):
             rows.append(extra)
+    # The change log is the template's record too, and leaving it off the
+    # manifest left it in the adopter's catalog describing somebody else's
+    # project: eleven entries, every one of them about a node `adopt` had just
+    # moved into `example/`. It travels with the nodes it cites, which is also
+    # what makes its relative links resolve on the other side without a single
+    # rewrite. `bin/adopt` guards the migration case, where an adopter's own
+    # log sits at this same path.
+    if os.path.isfile(os.path.join(ROOT, 'knowledge-catalog/log.md')):
+        rows.append('knowledge-catalog/log.md')
 
     open(os.path.join(ROOT, TEMPLATE_RECORD), 'w', encoding='utf-8').write(
         "# The template's own record, by identity rather than by pattern.\n"
